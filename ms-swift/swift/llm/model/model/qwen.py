@@ -909,6 +909,7 @@ def _forward_qwen3_vl_or_qwen3_omni(
     pixel_values_videos,
     image_grid_thw,
     video_grid_thw,
+    mm_token_type_ids=None,
 ):
     if inputs_embeds is None:
         inputs_embeds = self.get_input_embeddings()(input_ids)
@@ -946,8 +947,13 @@ def _forward_qwen3_vl_or_qwen3_omni(
             image_embeds = mixed_embeds[:image_tokens]
             video_embeds = mixed_embeds[image_tokens:]
 
-        image_mask = (input_ids == self.config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
-        video_mask = (input_ids == self.config.video_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+        image_mask = input_ids == self.config.image_token_id
+        video_mask = input_ids == self.config.video_token_id
+        if mm_token_type_ids is not None:
+            image_mask &= mm_token_type_ids == 1
+            video_mask &= mm_token_type_ids == 2
+        image_mask = image_mask.unsqueeze(-1).expand_as(inputs_embeds)
+        video_mask = video_mask.unsqueeze(-1).expand_as(inputs_embeds)
         if image_embeds is not None:
             image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             image_mask = image_mask.to(inputs_embeds.device)
@@ -1016,9 +1022,10 @@ def _compat_qwen3_vl_mixed_data(model, processor, is_moe: bool = False):
         image_grid_thw: Optional[torch.LongTensor] = None,
         video_grid_thw: Optional[torch.LongTensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        mm_token_type_ids: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Union[tuple, output_cls]:
-        if not self.training and not is_deepspeed_enabled():
+        if not self.training and not is_deepspeed_enabled() and mm_token_type_ids is None:
             return self.origin_forward(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -1038,12 +1045,13 @@ def _compat_qwen3_vl_mixed_data(model, processor, is_moe: bool = False):
 
         inputs_embeds, visual_pos_masks, deepstack_visual_embeds = _forward_qwen3_vl_or_qwen3_omni(
             self, processor, input_ids, inputs_embeds, pixel_values, pixel_values_videos, image_grid_thw,
-            video_grid_thw)
+            video_grid_thw, mm_token_type_ids=mm_token_type_ids)
         if position_ids is None:
             past_key_values_length = 0 if past_key_values is None else past_key_values.get_seq_length()
             if self.rope_deltas is None or past_key_values_length == 0:
+                from swift.llm.template.vision_utils import qwen3_vl_metadata_ids
                 position_ids, rope_deltas = self.get_rope_index(
-                    input_ids,
+                    qwen3_vl_metadata_ids(input_ids, mm_token_type_ids, self.config),
                     image_grid_thw,
                     video_grid_thw,
                     attention_mask=attention_mask,

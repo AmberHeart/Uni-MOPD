@@ -1,5 +1,6 @@
 import atexit
 import logging
+import os
 import socket
 import threading
 import time
@@ -18,7 +19,10 @@ from torch import nn
 from transformers.utils import is_torch_cuda_available
 
 from swift.llm import AdapterRequest, RolloutInferRequest, Template
-from swift.llm.infer.protocol import ChatCompletionResponse, RequestConfig, RolloutOutput
+from swift.llm.infer.protocol import WEIGHT_UPDATE_PROTOCOL_VERSION, ChatCompletionResponse, RequestConfig, RolloutOutput
+from swift.llm.infer.completion_stream import COMPLETION_STREAM_VERSION, CompletionProducer, CompletionQueue
+from swift.llm.infer.routing_protocol import ROUTING_PROTOCOL_VERSION
+from swift.llm.infer.persistent_session import SESSION_HEADER, SESSION_PROTOCOL_VERSION
 from swift.plugin import Metric
 from swift.utils import is_trl_available, is_vllm_ascend_available, is_vllm_available
 from .utils import format_host_for_url, is_valid_ipv6_address, peft_config_to_dict, resolve_hostname
@@ -36,6 +40,12 @@ if is_trl_available():
 
 logger = logging.getLogger(__name__)
 
+# Weight-sync control-plane requests either answer quickly (accept/dispatch)
+# or are themselves deadline-bound on the server. A stalled endpoint must
+# surface as an error here instead of hanging the coordinator forever while
+# other train ranks wait in collectives. Bulk /infer/ traffic is NOT covered.
+CONTROL_PLANE_TIMEOUT = float(os.environ.get('SWIFT_WEIGHT_CONTROL_TIMEOUT', '150'))
+
 
 class VLLMClient:
 
@@ -44,7 +54,10 @@ class VLLMClient:
                  hosts: List[str] = ['0.0.0.0'],
                  server_ports: List[int] = [8000],
                  group_ports: Optional[Union[int, List[int]]] = None,
-                 connection_timeout: float = 240.0):
+                 connection_timeout: float = 240.0,
+                 parallel_weight_sync: bool = False,
+                 persistent_session_id: Optional[str] = None,
+                 runtime_identity: Optional[str] = None):
         if not is_vllm_available():
             raise ImportError('vLLM is not installed. Please install it with `pip install vllm`.')
 
@@ -81,7 +94,67 @@ class VLLMClient:
             raise ValueError('group_port must be int or list of length num_servers')
 
         self.pynccl_comms = []
+        self.parallel_weight_sync = parallel_weight_sync
+        self._weight_sync_streams = None
+        self._routing_replay_checked = False
+        self._domain_generation_checked = False
+        self.persistent_session_id = persistent_session_id
+        self.runtime_identity = runtime_identity
+        self._persistent_closed = False
+        if bool(persistent_session_id) != bool(runtime_identity):
+            raise ValueError('Persistent rollout requires both session and runtime identity')
         self.check_server(connection_timeout)
+        if persistent_session_id:
+            self.begin_persistent_session()
+
+    def begin_persistent_session(self):
+        for session in self.sessions:
+            session.headers[SESSION_HEADER] = self.persistent_session_id
+        # Verify the entire fleet before claiming any server. A partially
+        # failed claim is not rolled back into a false "clean idle" state.
+        for session, base_url in zip(self.sessions, self.base_urls):
+            response = session.get(f'{base_url}/session_status/', timeout=CONTROL_PLANE_TIMEOUT)
+            info = response.json() if response.status_code == 200 else {}
+            if (info.get('session_protocol') != SESSION_PROTOCOL_VERSION
+                    or info.get('identity') != self.runtime_identity or info.get('state') != 'idle'
+                    or info.get('failed') or info.get('busy') or info.get('dirty')):
+                raise RuntimeError(f'Persistent rollout is incompatible, busy or failed at {base_url}: {info}')
+        for session, base_url in zip(self.sessions, self.base_urls):
+            response = session.post(
+                f'{base_url}/begin_session/',
+                json={'session_id': self.persistent_session_id, 'identity': self.runtime_identity},
+                timeout=CONTROL_PLANE_TIMEOUT)
+            info = response.json()
+            if (response.status_code != 200 or info.get('session_id') != self.persistent_session_id
+                    or info.get('ready') is not False):
+                raise RuntimeError(f'Failed to reset persistent rollout at {base_url}: {info}')
+
+    def require_domain_generation(self):
+        """Reject old servers that would silently ignore per-domain budgets."""
+        if self._domain_generation_checked:
+            return
+        for session, base_url in zip(self.sessions, self.base_urls):
+            response = session.post(f'{base_url}/get_engine_type/', timeout=CONTROL_PLANE_TIMEOUT)
+            if response.status_code != 200:
+                raise RuntimeError(f'Cannot verify per-domain generation support at {base_url}.')
+            info = response.json()
+            if (info.get('mopd_generation_version') != 1 or info.get('enable_multi_turn')
+                    or info.get('use_gym_env')):
+                raise RuntimeError(
+                    f'Per-domain MOPD generation needs matching single-turn server code at {base_url}.')
+        self._domain_generation_checked = True
+
+    def require_routing_replay(self):
+        """Require the opt-in protocol on EVERY server before an R3 rollout."""
+        if self._routing_replay_checked:
+            return
+        for session, base_url in zip(self.sessions, self.base_urls):
+            response = session.post(f'{base_url}/get_engine_type/', timeout=CONTROL_PLANE_TIMEOUT)
+            if response.status_code != 200 or response.json().get('routing_replay_version') != ROUTING_PROTOCOL_VERSION:
+                raise RuntimeError(
+                    f'R3 requires a matching route-enabled rollout server at {base_url}; '
+                    'start it with --vllm_return_routed_experts true.')
+        self._routing_replay_checked = True
 
     def check_server(self, total_timeout: float = 0.0, retry_interval: float = 2.0):
         server_status = [False] * self.num_servers
@@ -185,13 +258,49 @@ class VLLMClient:
 
         return [res for server_results in results for res in server_results]
 
+    def begin_completion_window(self, infer_requests, request_config, window, *,
+                                max_samples, max_tokens, max_bytes, timeout_seconds):
+        """Start CPU-only readers after the trainer has synchronized this policy."""
+        for session, base_url in zip(self.sessions, self.base_urls):
+            response = session.post(f'{base_url}/get_engine_type/', timeout=CONTROL_PLANE_TIMEOUT)
+            info = response.json() if response.status_code == 200 else {}
+            if (info.get('completion_stream_version') != COMPLETION_STREAM_VERSION
+                    or info.get('engine_type') != 'LLMEngine' or info.get('enable_multi_turn')
+                    or info.get('use_gym_env') or info.get('enable_lora')):
+                raise RuntimeError('Complete-response MOPD needs matching synchronous single-turn server code.')
+        requests = [asdict(value) if isinstance(value, RolloutInferRequest) else value for value in infer_requests]
+        config = asdict(request_config) if isinstance(request_config, RequestConfig) else request_config
+        queue = CompletionQueue(window, max_samples=max_samples, max_tokens=max_tokens,
+                                max_bytes=max_bytes, timeout_seconds=timeout_seconds)
+        return CompletionProducer(self.sessions, self.base_urls, requests, config, queue)
+
     def init_communicator(self, device: Union[int, str] = 0):
         self.pynccl_comms = []
+        old_nccl_net = os.environ.get('NCCL_NET')
+        requested_nccl_net = os.environ.get('MOPD_WEIGHT_SYNC_NCCL_NET')
+        if requested_nccl_net:
+            os.environ['NCCL_NET'] = requested_nccl_net
+        try:
+            self._init_communicator_inner(device)
+        finally:
+            if requested_nccl_net:
+                if old_nccl_net is None:
+                    os.environ.pop('NCCL_NET', None)
+                else:
+                    os.environ['NCCL_NET'] = old_nccl_net
+
+    def _init_communicator_inner(self, device: Union[int, str] = 0):
+        self.pynccl_comms = []
+        self._weight_sync_streams = None
         for i in range(self.num_servers):
-            response = self.sessions[i].get(f'{self.base_urls[i]}/get_world_size/')
+            response = self.sessions[i].get(f'{self.base_urls[i]}/get_world_size/', timeout=CONTROL_PLANE_TIMEOUT)
             if response.status_code != 200:
                 raise Exception(f'Server {i} failed: {response.text}')
-            vllm_world_size = response.json()['world_size']
+            payload = response.json()
+            if payload.get('weight_update_protocol') != WEIGHT_UPDATE_PROTOCOL_VERSION:
+                raise RuntimeError(f'Server {i} has an incompatible weight-update protocol; '
+                                   'restart server and trainer from the same ms-swift revision.')
+            vllm_world_size = payload['world_size']
 
             world_size = vllm_world_size + 1
             rank = vllm_world_size
@@ -211,8 +320,10 @@ class VLLMClient:
                     'host': bind_host,
                     'port': self.group_ports[i],
                     'world_size': world_size,
+                    'weight_update_protocol': WEIGHT_UPDATE_PROTOCOL_VERSION,
                     **kwargs
-                })
+                },
+                timeout=CONTROL_PLANE_TIMEOUT)
             if response.status_code != 200:
                 raise Exception(f'Server {i} init failed: {response.text}')
 
@@ -240,12 +351,16 @@ class VLLMClient:
                         'dtype': dtype,
                         'shape': shape
                     },
+                    timeout=CONTROL_PLANE_TIMEOUT,
                 )
                 if response.status_code != 200:
                     raise Exception(f'Server {i} update failed: {response.text}')
+                update_id = self._accepted_weight_update(response)
+                self._check_weight_receivers_ready(i)
 
                 self.pynccl_comms[i].broadcast(weights, src=self.pynccl_comms[i].rank)
                 self.pynccl_comms[i].group.barrier()
+                self._finish_weight_update(i, update_id)
             except Exception as e:
                 errors[i] = e
 
@@ -285,12 +400,16 @@ class VLLMClient:
                 response = self.sessions[i].post(
                     f'{self.base_urls[i]}/update_adapter_flattened_param/',
                     json=data,
+                    timeout=CONTROL_PLANE_TIMEOUT,
                 )
                 if response.status_code != 200:
                     raise Exception(f'Server {i} update adapter failed: {response.text}')
+                update_id = self._accepted_weight_update(response)
+                self._check_weight_receivers_ready(i)
 
                 self.pynccl_comms[i].broadcast(flattened_tensor, src=self.pynccl_comms[i].rank)
                 self.pynccl_comms[i].group.barrier()
+                self._finish_weight_update(i, update_id)
             except Exception as e:
                 errors[i] = e
 
@@ -342,14 +461,18 @@ class VLLMClient:
                 response = self.sessions[i].post(
                     f'{self.base_urls[i]}/update_adapter_param/',
                     json=data,
+                    timeout=CONTROL_PLANE_TIMEOUT,
                 )
                 if response.status_code != 200:
                     raise Exception(f'Server {i} update adapter failed: {response.text}')
+                update_id = self._accepted_weight_update(response)
+                self._check_weight_receivers_ready(i)
 
                 # Broadcast each tensor individually
                 for name, param in lora_params.items():
                     self.pynccl_comms[i].broadcast(param, src=self.pynccl_comms[i].rank)
                 self.pynccl_comms[i].group.barrier()
+                self._finish_weight_update(i, update_id)
             except Exception as e:
                 errors[i] = e
 
@@ -372,6 +495,27 @@ class VLLMClient:
         """
         errors = [None] * self.num_servers
         metadatas = [m.model_dump() if hasattr(m, 'model_dump') else m.dict() for m in metadatas]
+        streams = None
+        completed = None
+        if self.parallel_weight_sync:
+            if not flattened_tensor.is_cuda:
+                raise ValueError('parallel_weight_sync requires CUDA weight buffers.')
+            with torch.cuda.device(flattened_tensor.device):
+                if self._weight_sync_streams is None:
+                    self._weight_sync_streams = [
+                        torch.cuda.Stream(device=flattened_tensor.device) for _ in range(self.num_servers)
+                    ]
+                streams = self._weight_sync_streams
+                if any(stream.device != flattened_tensor.device for stream in streams):
+                    raise ValueError('Weight-buffer device changed; reinitialize the weight-sync communicator.')
+                ready = torch.cuda.Event()
+                ready.record(torch.cuda.current_stream(flattened_tensor.device))
+                completed = [torch.cuda.Event() for _ in streams]
+                for stream in streams:
+                    stream.wait_event(ready)
+                    # Also protect storage if a control-plane request fails
+                    # after another server has already enqueued its broadcast.
+                    flattened_tensor.record_stream(stream)
 
         def _update_single_server(i):
             try:
@@ -382,12 +526,24 @@ class VLLMClient:
                 response = self.sessions[i].post(
                     f'{self.base_urls[i]}/update_flattened_params/',
                     json=data,
+                    timeout=CONTROL_PLANE_TIMEOUT,
                 )
                 if response.status_code != 200:
                     raise Exception(f'Server {i} update flattened params failed: {response.text}')
+                update_id = self._accepted_weight_update(response)
+                self._check_weight_receivers_ready(i)
 
-                self.pynccl_comms[i].broadcast(flattened_tensor, src=self.pynccl_comms[i].rank)
+                if streams is None:
+                    self.pynccl_comms[i].broadcast(flattened_tensor, src=self.pynccl_comms[i].rank)
+                else:
+                    # CUDA's current device is thread-local. Both the explicit
+                    # send stream and its completion event belong to this GPU.
+                    with torch.cuda.device(flattened_tensor.device):
+                        self.pynccl_comms[i].broadcast(
+                            flattened_tensor, src=self.pynccl_comms[i].rank, stream=streams[i])
+                        completed[i].record(streams[i])
                 self.pynccl_comms[i].group.barrier()
+                self._finish_weight_update(i, update_id)
             except Exception as e:
                 errors[i] = e
 
@@ -399,6 +555,47 @@ class VLLMClient:
         all_errors = [e for e in errors if e is not None]
         if all_errors:
             raise RuntimeError(f'Multiple errors: {all_errors}')
+        if completed is not None:
+            # Finish this bucket before the caller releases it or packs another.
+            # Do not replace this with a profiler-only/global CUDA synchronize.
+            self._wait_for_weight_sends(completed)
+
+    @staticmethod
+    def _wait_for_weight_sends(events):
+        deadline = time.monotonic() + CONTROL_PLANE_TIMEOUT
+        while True:
+            pending = [index for index, event in enumerate(events) if not event.query()]
+            if not pending:
+                return
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f'Parallel weight sends did not complete within {CONTROL_PLANE_TIMEOUT}s; '
+                    f'pending servers: {pending}.')
+            time.sleep(0.001)
+
+    @staticmethod
+    def _accepted_weight_update(response):
+        payload = response.json()
+        if payload.get('status') != 'accepted' or not isinstance(payload.get('update_id'), int):
+            raise RuntimeError('Rollout server lacks the acknowledged weight-update protocol; '
+                               'restart it from the same ms-swift revision as the trainer.')
+        return payload['update_id']
+
+    def _finish_weight_update(self, server_idx: int, update_id: int):
+        response = self.sessions[server_idx].post(
+            f'{self.base_urls[server_idx]}/finish_weight_update/', json={'update_id': update_id},
+            timeout=CONTROL_PLANE_TIMEOUT)
+        if response.status_code != 200:
+            raise RuntimeError(f'Server {server_idx} did not load update {update_id}: {response.text}')
+        payload = response.json()
+        if payload.get('status') != 'loaded' or payload.get('update_id') != update_id:
+            raise RuntimeError(f'Server {server_idx} returned an invalid weight-load acknowledgment.')
+
+    def _check_weight_receivers_ready(self, server_idx: int):
+        errors = self.pynccl_comms[server_idx].group.all_gather_obj(None)
+        failures = [(rank, value) for rank, value in enumerate(errors) if value is not None]
+        if failures:
+            raise RuntimeError(f'Server {server_idx} cannot receive weights: {failures}')
 
     def update_model_params(self, model: nn.Module):
         for name, param in model.named_parameters():
@@ -409,9 +606,12 @@ class VLLMClient:
 
         def _reset_single_server(i):
             try:
-                response = self.sessions[i].post(f'{self.base_urls[i]}/reset_prefix_cache/')
+                response = self.sessions[i].post(f'{self.base_urls[i]}/reset_prefix_cache/',
+                                                 timeout=CONTROL_PLANE_TIMEOUT)
                 if response.status_code != 200:
                     raise Exception(f'Server {i} reset failed: {response.text}')
+                if response.json().get('success') is not True:
+                    raise RuntimeError(f'Server {i} did not confirm prefix-cache reset.')
             except Exception as e:
                 errors[i] = e
 
@@ -437,9 +637,29 @@ class VLLMClient:
         return result
 
     def close_communicator(self):
+        if getattr(self, 'persistent_session_id', None):
+            if self._persistent_closed:
+                return
+            errors = []
+            for session, base_url in zip(self.sessions, self.base_urls):
+                try:
+                    response = session.post(f'{base_url}/end_session/', timeout=CONTROL_PLANE_TIMEOUT)
+                    info = response.json()
+                    if (response.status_code != 200 or info.get('state') != 'idle'
+                            or info.get('session_id') is not None):
+                        raise RuntimeError(f'Persistent rollout release failed: {info}')
+                except Exception as error:
+                    errors.append(f'{base_url}: {error}')
+            self.pynccl_comms.clear()
+            self._weight_sync_streams = None
+            if errors:
+                raise RuntimeError('; '.join(errors))
+            self._persistent_closed = True
+            return
         for i in range(self.num_servers):
             try:
-                response = self.sessions[i].post(f'{self.base_urls[i]}/close_communicator/')
+                response = self.sessions[i].post(f'{self.base_urls[i]}/close_communicator/',
+                                                 timeout=CONTROL_PLANE_TIMEOUT)
                 if response.status_code != 200:
                     logger.warning(f'Server {i} close failed: {response.text}')
             except Exception as e:

@@ -1,0 +1,5 @@
+# Matched ToDi control. All unspecified values are identical to the RKL recipe.
+defaults: unimopd_uniform_rkl.yaml
+gkd_loss_type: todi
+gkd_todi_beta: 1
+beta: 1

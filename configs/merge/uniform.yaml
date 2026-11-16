@@ -1,0 +1,17 @@
+# Copyright (c) 2026, Uni-MOPD contributors.
+# SPDX-License-Identifier: Apache-2.0
+
+# Paper initialization: uniform DARE merge over five specialists.
+method: dare
+base: "${BASE_MODEL}"
+inputs:
+  - "${TEACHER_STEM}"
+  - "${TEACHER_VQA}"
+  - "${TEACHER_DOCUMENT}"
+  - "${TEACHER_GUI}"
+  - "${TEACHER_EMBODIED}"
+weights: [0.2, 0.2, 0.2, 0.2, 0.2]
+drop_rates: [0.7, 0.7, 0.7, 0.7, 0.7]
+seed: 42
+workers: 4
+output_dir: "${OUTPUT_DIR}"

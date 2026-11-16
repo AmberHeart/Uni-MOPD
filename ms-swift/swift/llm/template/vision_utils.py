@@ -3,6 +3,7 @@ import base64
 import math
 import os
 import re
+import warnings
 from io import BytesIO
 from typing import Any, Callable, List, TypeVar, Union
 
@@ -14,6 +15,46 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from swift.utils import get_env_args
+
+
+def qwen3_vl_sanitize_image_metadata(image: Image.Image) -> Image.Image:
+    """Keep decoded pixels, dropping only an EXIF block that Pillow cannot parse.
+
+    Qwen consumes the already resized raster, but vLLM 0.11 also calls getexif()
+    when hashing that raster. A malformed optional TIFF header must not make
+    an otherwise valid Qwen image fail only on the rollout side.
+    """
+    if 'exif' not in image.info and 'Raw profile type exif' not in image.info:
+        return image
+    try:
+        image.getexif()
+    except SyntaxError as error:
+        # Image.copy() creates fresh EXIF state and owns a separate info dict.
+        # Do not edit the source file, resize/rotate the image or drop samples.
+        image = image.copy()
+        image.info.pop('exif', None)
+        image.info.pop('Raw profile type exif', None)
+        warnings.warn(f'Ignoring malformed Qwen3-VL image EXIF metadata: {error}', stacklevel=2)
+    return image
+
+
+def qwen3_vl_metadata_ids(input_ids, mm_token_type_ids, config):
+    """Neutral IDs for position metadata only; embedding/labels keep original IDs.
+
+    Generated image/video delimiters are ordinary language tokens, not requests
+    to inject another image or index another grid. Actual media tags are marked
+    by the template before expansion, independently of supervision masks.
+    """
+    if mm_token_type_ids is None:
+        return input_ids
+    media_types = torch.as_tensor(mm_token_type_ids, device=input_ids.device).reshape_as(input_ids)
+    special = torch.zeros_like(input_ids, dtype=torch.bool)
+    for name in ('image_token_id', 'video_token_id', 'vision_start_token_id', 'vision_end_token_id'):
+        token_id = getattr(config, name, None)
+        if token_id is not None:
+            special |= input_ids == token_id
+    return input_ids.masked_fill(special & (media_types == 0), 0)
+
 
 # >>> internvl
 IMAGENET_MEAN = (0.485, 0.456, 0.406)

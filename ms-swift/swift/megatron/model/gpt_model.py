@@ -34,7 +34,7 @@ class OutputLayerLinear(TELinear):
 
     def forward(self, hidden_states, *args, **kwargs):
         args = get_args()
-        if args.sequence_parallel and args.tensor_model_parallel_size > 1:
+        if self.sequence_parallel and args.sequence_parallel and args.tensor_model_parallel_size > 1:
             hidden_states = gather_from_sequence_parallel_region(hidden_states)
         return super().forward(hidden_states)
 
@@ -272,6 +272,8 @@ class GPTModel(McoreGPTModel):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[torch.Tensor] = None,
+        valid_token_indices: Optional[torch.Tensor] = None,
+        mopd_return_hidden_states: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         """Forward function of the GPT Model This function passes the input tensors
@@ -327,6 +329,8 @@ class GPTModel(McoreGPTModel):
             runtime_gather_output=runtime_gather_output,
             extra_block_kwargs=extra_block_kwargs,
             inference_context=inference_context,
+            valid_token_indices=valid_token_indices,
+            mopd_return_hidden_states=mopd_return_hidden_states,
         )
 
     def _postprocess(
@@ -347,6 +351,8 @@ class GPTModel(McoreGPTModel):
         runtime_gather_output=None,
         extra_block_kwargs=None,
         inference_context=None,
+        valid_token_indices=None,
+        mopd_return_hidden_states=False,
     ):
         """Postprocesses decoder hidden states to generate logits or compute loss.
 
@@ -449,13 +455,72 @@ class GPTModel(McoreGPTModel):
                 # (so that the output layer, which expects S×B×H, receives only the final token)
                 hidden_states = inference_context.last_token_logits(hidden_states.squeeze(1).unsqueeze(0)).unsqueeze(1)
 
-        logits, _ = self.output_layer(hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output)
+        # When the GKD trainer pre-computes a valid-token selection (the
+        # `labels != -100` rows the loss actually consumes), use it to slice
+        # the hidden states BEFORE the output layer. The full LM-head output
+        # tensor is `[seq_tokens, vocab=151936]` in bf16 (~4.6 GiB at the
+        # worst packed micro-batch on this model), which dominates peak
+        # memory in this path. Selecting first
+        # produces `[valid_tokens, vocab]` instead and matches what the JSD
+        # loss already masks down to. Inference / MTP / SFT callers do not
+        # set this kwarg and continue to project the full hidden states.
+        valid_token_select_active = (
+            valid_token_indices is not None
+            and not in_inference_mode
+            and labels is None
+            and not self.mtp_process)
+        # Wrap the valid-token selection and the output-layer projection in
+        # try/finally so the temporary `output_layer.sequence_parallel = False`
+        # override (set by EITHER the inference last-token path above or the GKD
+        # valid-token-select path below) is ALWAYS restored. If output_layer(...)
+        # raises (e.g. OOM), an unrestored flag would corrupt every subsequent
+        # forward pass by skipping the required sequence-parallel gather.
+        try:
+            if valid_token_select_active:
+                # Under sequence_parallel + TP>1, hidden_states arriving here is still
+                # sharded along the sequence dim ([seq/TP, batch, hidden]). valid_token_indices
+                # is computed from the FULL-sequence labels, so we must reconstruct the full
+                # sequence BEFORE selecting rows (mirrors the inference path above). Without
+                # this gather, index_select addresses the full sequence into a shard => wrong
+                # rows / OOB => garbage student logits.
+                if self.output_layer.sequence_parallel:
+                    # tensor_parallel_output_grad=False: once we flip the output layer to
+                    # non-SP below, ColumnParallelLinear all-reduces the dgrad across TP on
+                    # backward (the TP copy path), so the hidden-state gradient is already
+                    # reduced/replicated. This gather's backward must then only SCATTER it
+                    # back to the local sequence shard (_split_along_first_dim). The default
+                    # True would reduce-scatter (sum across TP) a second time, double-counting
+                    # the gradient by a factor of TP. See _GatherFromSequenceParallelRegion.
+                    hidden_states = gather_from_sequence_parallel_region(
+                        hidden_states, tensor_parallel_output_grad=False, group=self.pg_collection.tp)
+                    self.output_layer.sequence_parallel = False
+                    sequence_parallel_override = True
+                # hidden_states is now full [seq, batch, hidden] (Megatron sb h layout).
+                # Flatten in (seq, batch) order, select the valid rows, and restore a
+                # [valid, 1, hidden] tensor so the output_layer sees [N, B, H] with B=1.
+                # The caller maps BS loss-mask positions to SB offsets while
+                # retaining BS output order; this also works when batch > 1.
+                _s, _b, _h = hidden_states.shape
+                flat_hidden = hidden_states.reshape(_s * _b, _h)
+                hidden_states = flat_hidden.index_select(0, valid_token_indices).unsqueeze(1)
 
-        # Restore sequence parallel execution to the output layer if necessary.
-        if sequence_parallel_override:
-            assert (in_inference_mode and inference_context.is_dynamic_batching()
-                    and inference_context.materialize_only_last_token_logits)
-            self.output_layer.sequence_parallel = True
+            if mopd_return_hidden_states:
+                if not valid_token_select_active:
+                    raise ValueError('Streamed GKD heads require selected training positions and no MTP.')
+                return hidden_states.transpose(0, 1).contiguous()
+            logits, _ = self.output_layer(
+                hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output)
+        finally:
+            # Restore sequence parallel execution to the output layer if WE flipped it.
+            # The override is set either by the inference last-token path above or by the
+            # GKD valid-token-select path (training). Only the inference origin carries the
+            # dynamic-batching invariant, so guard the assert on in_inference_mode; the
+            # training override simply restores the flag without tripping it.
+            if sequence_parallel_override:
+                if in_inference_mode:
+                    assert (inference_context.is_dynamic_batching()
+                            and inference_context.materialize_only_last_token_logits)
+                self.output_layer.sequence_parallel = True
 
         if has_config_logger_enabled(self.config):
             payload = OrderedDict({

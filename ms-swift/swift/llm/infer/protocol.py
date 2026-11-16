@@ -110,7 +110,7 @@ class ChatCompletionRequestMixin:
 
 @dataclass
 class MultiModalRequestMixin:
-    images: List[str] = field(default_factory=list)
+    images: List[Union[str, Dict[str, Any]]] = field(default_factory=list)
     audios: List[str] = field(default_factory=list)
     videos: List[str] = field(default_factory=list)
     objects: Dict[str, Any] = field(default_factory=dict)
@@ -142,7 +142,13 @@ class MultiModalRequestMixin:
                 values = [values]
                 setattr(self, key, values)
             for i, val in enumerate(values):
-                values[i] = self.to_base64(val)
+                if key == 'images' and isinstance(val, dict):
+                    from swift.llm.template.image_budget import split_image_entry
+                    source, budget = split_image_entry(val)
+                    encoded = self.to_base64(source)
+                    values[i] = {'path': encoded, **budget} if budget else encoded
+                else:
+                    values[i] = self.to_base64(val)
 
 
 @dataclass
@@ -452,11 +458,15 @@ class CompletionStreamResponse:
     created: int = field(default_factory=lambda: int(time.time()))
 
 
+WEIGHT_UPDATE_PROTOCOL_VERSION = 1
+
+
 class InitCommunicatorRequest(BaseModel):
     host: str
     port: int
     world_size: int
     client_device_uuid: Optional[str] = None
+    weight_update_protocol: Optional[int] = None
 
 
 class UpdateWeightsRequest(BaseModel):

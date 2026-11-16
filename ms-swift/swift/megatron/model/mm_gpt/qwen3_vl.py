@@ -22,6 +22,38 @@ from .utils import HuggingFaceModule
 
 te_checkpoint = None
 
+
+class _SliceDeepstackForSP(torch.autograd.Function):
+    """Keep this rank's SP slice of the deepstack embeds, with a TP-consistent backward.
+
+    The main visual branch reaches the decoder through ``scatter_to_sequence_parallel_region``,
+    whose backward all-gathers, so after backward every TP rank holds the FULL gradient w.r.t.
+    the pre-scatter tensor. ViT params are then reduced with ReduceOp.AVG
+    (``average_gradients_across_tp_domain``), which is only correct because the per-rank grads
+    are already identical full copies.
+
+    A plain ``x[:, start:end]`` breaks that contract: its backward zero-pads, so each rank
+    carries only its own slice's contribution and AVG divides the summed gradient by
+    tp_world_size -- scaling the deepstack branch by 1/TP relative to the main branch. The
+    slices are disjoint and cover the whole tensor, so an all-reduce SUM in backward restores
+    the full gradient on every rank and matches the main branch.
+    """
+
+    @staticmethod
+    def forward(ctx, embeds, start, end, group):
+        ctx.start, ctx.end = start, end
+        ctx.group = group
+        ctx.seq_len = embeds.shape[1]
+        return embeds[:, start:end]
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad = grad_output.new_zeros(grad_output.shape[0], ctx.seq_len, *grad_output.shape[2:])
+        grad[:, ctx.start:ctx.end] = grad_output
+        torch.distributed.all_reduce(grad, op=torch.distributed.ReduceOp.SUM, group=ctx.group)
+        return grad, None, None, None
+
+
 try:
     import transformer_engine.pytorch as te  # pylint: disable=unused-import
 
@@ -92,8 +124,14 @@ class Qwen3Omni_Vit(HuggingFaceModule):
                 image_embeds = mixed_embeds[:image_tokens]
                 video_embeds = mixed_embeds[image_tokens:]
 
-            image_mask = (input_ids == config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
-            video_mask = (input_ids == config.video_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+            media_types = inputs.get('mm_token_type_ids')
+            image_mask = input_ids == config.image_token_id
+            video_mask = input_ids == config.video_token_id
+            if media_types is not None:
+                image_mask &= media_types == 1
+                video_mask &= media_types == 2
+            image_mask = image_mask.unsqueeze(-1).expand_as(inputs_embeds)
+            video_mask = video_mask.unsqueeze(-1).expand_as(inputs_embeds)
             if image_embeds is not None:
                 image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
                 image_mask = image_mask.to(inputs_embeds.device)
@@ -138,7 +176,12 @@ class Qwen3Omni_Vit(HuggingFaceModule):
                 visual_start = 0 if tp_rank == 0 else sum(mask_tokens[:tp_rank])
                 visual_end = visual_start + mask_tokens[tp_rank]
                 visual_pos_masks = visual_pos_masks[tp_rank]
-                deepstack_visual_embeds = deepstack_visual_embeds[:, visual_start:visual_end]
+                if deepstack_visual_embeds.requires_grad:
+                    deepstack_visual_embeds = _SliceDeepstackForSP.apply(
+                        deepstack_visual_embeds, visual_start, visual_end,
+                        parallel_state.get_tensor_model_parallel_group())
+                else:
+                    deepstack_visual_embeds = deepstack_visual_embeds[:, visual_start:visual_end]
         return {
             'inputs_embeds': inputs_embeds,
             'visual_pos_masks': visual_pos_masks,
@@ -274,8 +317,9 @@ class Qwen3VLTransformerBlock(gpt_model.TransformerBlock):
                         and layer_idx < self.config.recompute_num_layers + recompute_skip_num_layers):
                     hidden_states, context = checkpoint_handler(custom(layer_idx, layer_idx + 1))
                 else:
-                    hidden_states, context = custom(layer_idx, layer_idx + 1)(hidden_states, attention_mask, context,
-                                                                              context_mask, rotary_pos_emb)
+                    hidden_states, context = custom(layer_idx, layer_idx + 1)(
+                        hidden_states, attention_mask, context, context_mask, rotary_pos_emb,
+                        visual_pos_masks, deepstack_visual_embeds)
         else:
             raise ValueError('Invalid activation recompute method.')
 

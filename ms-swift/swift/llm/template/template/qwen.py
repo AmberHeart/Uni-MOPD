@@ -17,11 +17,13 @@ from swift.llm import get_packed_seq_params, to_float_dtype
 from swift.utils import get_env_args, is_deepspeed_enabled
 from ..base import Template
 from ..constant import LLMTemplateType, MLLMTemplateType
+from ..image_budget import split_image_entry
 from ..register import register_template
 from ..template_inputs import StdTemplateInputs
 from ..template_meta import TemplateMeta
-from ..utils import Context, Word, findall
-from ..vision_utils import load_audio, load_batch, load_video_ovis2, load_video_ovis2_5
+from ..utils import Context, MediaTokenIds, Word, findall
+from ..vision_utils import (load_audio, load_batch, load_video_ovis2, load_video_ovis2_5, qwen3_vl_metadata_ids,
+                           qwen3_vl_sanitize_image_metadata)
 from .llama import Llama3TemplateMeta
 from .utils import DEFAULT_SYSTEM, ChatmlTemplateMeta
 
@@ -292,7 +294,21 @@ class Qwen2VLTemplate(Template):
         assert media_type in {'image', 'video'}
         kwargs = {'image_patch_size': self.processor.image_processor.patch_size} if self.version == 'v3' else {}
         if media_type == 'image':
-            inputs.images[index] = fetch_image({'image': inputs.images[index]}, **kwargs)
+            image_entry = {'image': inputs.images[index]}
+            if self.version == 'v3':
+                budgets = getattr(inputs, '_qwen3_image_budgets', [])
+                budget = budgets[index] if index < len(budgets) else {}
+                if os.environ.get('MOPD_REQUIRE_IMAGE_BUDGETS', '0').lower() in {'1', 'true'} and len(budget) != 2:
+                    raise ValueError(f'Image {index} lacks explicit min_pixels/max_pixels')
+                image_entry.update(budget)
+            inputs.images[index] = fetch_image(image_entry, **kwargs)
+            if self.version == 'v3':
+                inputs.images[index] = qwen3_vl_sanitize_image_metadata(inputs.images[index])
+            if self.version == 'v3' and self.mode == 'vllm':
+                # fetch_image already applies the Qwen image budget. Training
+                # disables processor resizing too; otherwise vLLM's checkpoint
+                # minimum silently enlarges small images a second time.
+                inputs.mm_processor_kwargs.setdefault('do_resize', False)
             if self.mode == 'lmdeploy':
                 return ['<|vision_start|>', [-100], '<|vision_end|>']
             else:
@@ -479,6 +495,29 @@ register_template(
 
 class Qwen3VLTemplate(Qwen2VLTemplate):
     version = 'v3'
+    track_mm_token_types = True
+
+    def _preprocess_inputs(self, inputs):
+        # Keep the limits before the common loader turns entries into PIL images.
+        # They belong to each image, never to shared template/processor state.
+        entries = [split_image_entry(image) for image in inputs.images]
+        inputs.images = [entry[0] for entry in entries]
+        inputs._qwen3_image_budgets = [entry[1] for entry in entries]
+        if self.max_pixels is not None and any(inputs._qwen3_image_budgets):
+            raise ValueError('Per-image budgets require Qwen MIN_PIXELS/MAX_PIXELS defaults, not generic --max_pixels')
+        super()._preprocess_inputs(inputs)
+
+    def replace_tag(self, media_type, index, inputs):
+        contexts = super().replace_tag(media_type, index, inputs)
+        kind = 1 if media_type == 'image' else 2
+        return [MediaTokenIds(self._tokenize(context) if isinstance(context, str) else context, kind)
+                for context in contexts]
+
+    def _get_position_ids(self, inputs: Dict[str, Any]):
+        metadata_inputs = dict(inputs)
+        metadata_inputs['input_ids'] = qwen3_vl_metadata_ids(
+            inputs['input_ids'], inputs.get('mm_token_type_ids'), self.config)
+        return super()._get_position_ids(metadata_inputs)
 
     def _encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
         encoded = Template._encode(self, inputs)
@@ -486,6 +525,7 @@ class Qwen3VLTemplate(Qwen2VLTemplate):
         input_ids = encoded['input_ids']
         labels = encoded['labels']
         loss_scale = encoded.get('loss_scale', None)
+        media_types = encoded['mm_token_type_ids']
         for media_type in ['images', 'videos']:
             mm_data = getattr(inputs, media_type)
             if mm_data:
@@ -506,7 +546,11 @@ class Qwen3VLTemplate(Qwen2VLTemplate):
                     media_inputs.pop('input_ids', None)
                     media_inputs.pop('attention_mask', None)
                     media_token = self.video_token_id
-                idx_list = findall(input_ids, media_token)
+                kind = 1 if media_type == 'images' else 2
+                idx_list = [i for i in findall(input_ids, media_token) if media_types[i] == kind]
+                if len(idx_list) != len(mm_data):
+                    raise ValueError(f'Qwen3-VL media provenance mismatch: {len(idx_list)} '
+                                     f'{media_type} tags for {len(mm_data)} media inputs.')
                 merge_length = processor.image_processor.merge_size**2
 
                 def _get_new_tokens(i):
@@ -518,11 +562,15 @@ class Qwen3VLTemplate(Qwen2VLTemplate):
 
                 input_ids, labels, loss_scale = self._extend_tokens(input_ids, labels, loss_scale, idx_list,
                                                                     _get_new_tokens)
+                media_types = self._extend_tokens(
+                    media_types, None, None, idx_list,
+                    lambda i: [kind] * len(_get_new_tokens(i)))[0]
                 encoded.update(media_inputs)
 
         encoded['input_ids'] = input_ids
         encoded['labels'] = labels
         encoded['loss_scale'] = loss_scale
+        encoded['mm_token_type_ids'] = media_types
         return encoded
 
     def _post_encode(self, model, inputs: Dict[str, Any]) -> Dict[str, Any]:

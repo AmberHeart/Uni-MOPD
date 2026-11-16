@@ -9,6 +9,8 @@ from tqdm.asyncio import tqdm_asyncio
 from swift.llm import InferRequest, Template, VllmEngine
 from swift.plugin import Metric
 from ..protocol import ChatCompletionResponse, ChatCompletionResponseChoice, ChatMessage, RequestConfig, RolloutOutput
+from ..routing_protocol import ROUTING_INFO_KEY, ROUTING_PROTOCOL_VERSION
+from ..mopd_generation import (MOPD_GENERATION_INFO_KEY, apply_request_generation, request_generation_metadata)
 from .utils import AdapterRequest
 
 try:
@@ -58,8 +60,19 @@ class GRPOVllmEngine(VllmEngine):
         quantization: Optional[str] = None,
         engine_kwargs: Optional[Dict[str, Any]] = None,
         template: Optional[Template] = None,
+        return_routed_experts: bool = False,
         **kwargs,
     ) -> None:
+        self.return_routed_experts = return_routed_experts
+        self._routing_capabilities_checked = False
+        self._mopd_generation_by_request = {}
+        if return_routed_experts:
+            from ..vllm_routing_replay import BOOTSTRAP_ENV, CONFIG_KEY, install_vllm_routing_hooks
+            os.environ[BOOTSTRAP_ENV] = '1'
+            install_vllm_routing_hooks()
+            engine_kwargs = dict(engine_kwargs or {})
+            engine_kwargs['additional_config'] = {
+                **engine_kwargs.get('additional_config', {}), CONFIG_KEY: True}
         super().__init__(
             model_id_or_path=model_id_or_path,
             torch_dtype=torch_dtype,
@@ -95,6 +108,25 @@ class GRPOVllmEngine(VllmEngine):
             template=template,
         )
 
+    def _request_config_for_inputs(self, request_config, inputs):
+        return apply_request_generation(request_config, request_generation_metadata(inputs))
+
+    def _add_request(self, inputs, generation_config, request_id, *args, **kwargs):
+        result = super()._add_request(inputs, generation_config, request_id, *args, **kwargs)
+        metadata = request_generation_metadata(inputs)
+        if metadata is not None:
+            self._mopd_generation_by_request[request_id] = {
+                **metadata, 'requested_max_tokens': metadata['max_tokens'],
+                'max_tokens': generation_config.max_tokens, 'temperature': generation_config.temperature,
+            }
+        return result
+
+    def _attach_generation_metadata(self, outputs):
+        for output in outputs:
+            metadata = self._mopd_generation_by_request.pop(output.response.id, None)
+            if metadata is not None:
+                output.rollout_infos = {**(output.rollout_infos or {}), MOPD_GENERATION_INFO_KEY: metadata}
+
     def infer(
         self,
         infer_requests: List[Union[InferRequest, Dict[str, Any]]],
@@ -105,6 +137,13 @@ class GRPOVllmEngine(VllmEngine):
         use_tqdm: Optional[bool] = None,
         adapter_request: Optional[AdapterRequest] = None,
     ) -> List[RolloutOutput]:
+        if self.return_routed_experts:
+            request_config = request_config or RequestConfig()
+            if request_config.n != 1 or request_config.stream:
+                raise ValueError('R3 export requires non-streaming requests with n=1.')
+            if not self._routing_capabilities_checked:
+                self._check_routing_capabilities(
+                    self.engine.collective_rpc(method='mopd_routing_capabilities', timeout=120))
         if not adapter_request and self.enable_lora:
             lora_int_ids = list(self.engine.list_loras())
             if lora_int_ids:
@@ -131,7 +170,43 @@ class GRPOVllmEngine(VllmEngine):
                     raise TypeError('Result must be a ChatCompletionResponse or RolloutOutput instance.')
                 res[i] = RolloutOutput(response=result)
 
+        if self.return_routed_experts:
+            for chunk in self._routing_export_chunks(res):
+                request_ids = [output.response.id for output in chunk]
+                replies = self.engine.collective_rpc(
+                    method='mopd_pop_routing_traces', args=(request_ids,), timeout=120)
+                self._attach_routing(chunk, replies)
+        self._attach_generation_metadata(res)
         return res
+
+    def infer_completed(self, infer_requests, request_config, *, completion_callback):
+        """Deliver whole responses with R3 before the batch's last answer finishes.
+
+        This retains the synchronous native engine and unchanged sampling
+        settings. It is deliberately separate from token-streaming/async/LoRA
+        paths; callbacks never run model or routing collectives in an I/O thread.
+        """
+        if self.use_async_engine or self.enable_lora:
+            raise ValueError('Complete-response MOPD delivery supports synchronous full-model inference only.')
+        if request_config.n != 1 or request_config.stream or not request_config.return_details:
+            raise ValueError('Complete-response MOPD delivery requires n=1, full token details and no token stream.')
+        if self.return_routed_experts and not self._routing_capabilities_checked:
+            self._check_routing_capabilities(
+                self.engine.collective_rpc(method='mopd_routing_capabilities', timeout=120))
+
+        def completed(rows):
+            outputs = [RolloutOutput(response=response) for _, response, _ in rows]
+            if self.return_routed_experts:
+                for chunk in self._routing_export_chunks(outputs):
+                    replies = self.engine.collective_rpc(
+                        method='mopd_pop_routing_traces',
+                        args=([output.response.id for output in chunk],), timeout=120)
+                    self._attach_routing(chunk, replies)
+            self._attach_generation_metadata(outputs)
+            completion_callback([(index, output, timing) for (index, _, timing), output in zip(rows, outputs)])
+
+        return super().infer(
+            infer_requests, request_config, use_tqdm=False, completion_callback=completed)
 
     async def async_infer(self,
                           infer_requests: List[InferRequest],
@@ -143,6 +218,12 @@ class GRPOVllmEngine(VllmEngine):
         if request_config is None:
             request_config = RequestConfig()
         assert request_config.n == 1
+        if self.return_routed_experts:
+            if request_config.stream:
+                raise ValueError('R3 export requires non-streaming requests.')
+            if not self._routing_capabilities_checked:
+                self._check_routing_capabilities(
+                    await self.engine.collective_rpc(method='mopd_routing_capabilities', timeout=120))
 
         tasks = [self.infer_async(infer_request, request_config, **kwargs) for infer_request in infer_requests]
         if use_tqdm is None:
@@ -155,7 +236,77 @@ class GRPOVllmEngine(VllmEngine):
                     raise TypeError('Result must be a ChatCompletionResponse or RolloutOutput instance.')
                 res[i] = RolloutOutput(response=result)
 
+        if self.return_routed_experts:
+            for chunk in self._routing_export_chunks(res):
+                request_ids = [output.response.id for output in chunk]
+                replies = await self.engine.collective_rpc(
+                    method='mopd_pop_routing_traces', args=(request_ids,), timeout=120)
+                self._attach_routing(chunk, replies)
+        self._attach_generation_metadata(res)
         return res
+
+    @staticmethod
+    def _routing_export_chunks(outputs, token_budget=131072):
+        # ~64 MiB JSON payload for Qwen3-VL-30B's uint8 [tokens, 48, 8]
+        # routing bank. Do not build a multi-GiB worker RPC at full global batch size.
+        chunk, tokens = [], 0
+        for output in outputs:
+            usage = output.response.usage
+            length = max(1, usage.prompt_tokens + usage.completion_tokens - 1)
+            if chunk and tokens + length > token_budget:
+                yield chunk
+                chunk, tokens = [], 0
+            chunk.append(output)
+            tokens += length
+        if chunk:
+            yield chunk
+
+    @staticmethod
+    def _routing_replies(replies):
+        if isinstance(replies, list):
+            for item in replies:
+                yield from GRPOVllmEngine._routing_replies(item)
+        elif isinstance(replies, dict):
+            yield replies
+        else:
+            raise RuntimeError(f'Invalid routing RPC result: {type(replies).__name__}.')
+
+    def _check_routing_capabilities(self, replies):
+        workers = list(self._routing_replies(replies))
+        if (not workers or not any(worker.get('source') for worker in workers)
+                or any(not worker.get('ready') or worker.get('version') != ROUTING_PROTOCOL_VERSION
+                       for worker in workers)):
+            raise RuntimeError('All rollout workers must use the matching, initialized R3 exporter.')
+        self._routing_capabilities_checked = True
+
+    def _attach_routing(self, outputs, replies):
+        from swift.llm.infer.routing_protocol import bind_routing_trace
+
+        captures = {}
+        for worker in self._routing_replies(replies):
+            for request_id, trace in worker.items():
+                if request_id in captures:
+                    raise RuntimeError(f'R3 request {request_id} was captured by multiple DP sources.')
+                captures[request_id] = trace
+        for output in outputs:
+            request_id = output.response.id
+            if request_id not in captures:
+                raise RuntimeError(f'No completed routing trace for rollout request {request_id}.')
+            response = output.response
+            if len(response.choices) != 1:
+                raise RuntimeError('R3 binding requires exactly one returned completion.')
+            try:
+                trace = bind_routing_trace(
+                    captures.pop(request_id),
+                    response.prompt_token_ids,
+                    response.choices[0].token_ids,
+                    max_tokens=self.engine.model_config.max_model_len,
+                )
+            except ValueError as error:
+                raise ValueError(f'R3 request {request_id}: {error}') from error
+            output.rollout_infos[ROUTING_INFO_KEY] = trace
+        if captures:
+            raise RuntimeError('Routing RPC returned traces belonging to another request batch.')
 
     async def _batch_infer_stream(self,
                                   tasks,

@@ -476,3 +476,156 @@ class MegatronPretrainingRandomSampler:
                 self.consumed_samples += self.micro_batch_times_data_parallel_size
                 yield batch
                 batch = []
+
+
+# Per-global-batch equal-share domain sampler: emits a round-robin domain stream
+# per DP rank so any contiguous run whose length is a multiple of len(domains) is
+# automatically domain-balanced. Optional; the released recipe does not use it.
+class DomainBalancedRandomSampler:
+
+    def __init__(
+        self,
+        dataset,
+        total_samples,
+        consumed_samples,
+        micro_batch_size,
+        data_parallel_rank,
+        data_parallel_size,
+        data_sharding,
+        shuffle: bool = True,
+        group_by_length: bool = False,
+        domain_teacher_mapping: Optional[Dict[str, int]] = None,
+    ):
+        self.dataset = dataset
+        self.total_samples = total_samples
+        self.consumed_samples = consumed_samples
+        self.micro_batch_size = micro_batch_size
+        self.data_parallel_rank = data_parallel_rank
+        self.data_parallel_size = data_parallel_size
+        if group_by_length:
+            raise ValueError('group_by_length=True is mutually exclusive with '
+                             'mopd_domain_balanced_sampler=True')
+        if not domain_teacher_mapping:
+            raise ValueError('DomainBalancedRandomSampler requires a non-empty domain_teacher_mapping')
+        self.data_sharding = data_sharding
+        self.shuffle = shuffle
+        self.group_by_length = group_by_length
+        self.domain_teacher_mapping = dict(domain_teacher_mapping)
+        self.micro_batch_times_data_parallel_size = self.micro_batch_size * data_parallel_size
+        self.last_batch_size = self.total_samples % self.micro_batch_times_data_parallel_size
+
+        assert self.total_samples > 0, 'no sample to consume: {}'.format(self.total_samples)
+        assert self.micro_batch_size > 0
+        assert data_parallel_size > 0
+        assert self.data_parallel_rank < data_parallel_size, (
+            'data_parallel_rank should be smaller than data size: {}, '
+            '{}'.format(self.data_parallel_rank, data_parallel_size))
+
+        # Read the domain column once. Prefer the columnar path (like `self.lengths`
+        # in the parent sampler); fall back to per-sample if the dataset object
+        # doesn't support column-style access.
+        try:
+            domains = self.dataset['domain']
+            self.domains = list(domains)
+        except (KeyError, TypeError, IndexError, AttributeError):
+            self.domains = [self.dataset[i]['domain'] for i in range(len(self.dataset))]
+
+        # Canonical bucket order = domains sorted by their teacher index. Identical
+        # across every DP rank so the round-robin phase is aligned.
+        self._ordered_domains = sorted(self.domain_teacher_mapping.keys(),
+                                       key=lambda d: self.domain_teacher_mapping[d])
+        buckets: Dict[str, list] = {d: [] for d in self._ordered_domains}
+        for idx, dom in enumerate(self.domains):
+            if dom not in buckets:
+                raise ValueError(
+                    f'sample {idx} has domain={dom!r} which is not in domain_teacher_mapping '
+                    f'(keys: {sorted(self.domain_teacher_mapping.keys())})')
+            buckets[dom].append(idx)
+        for dom in self._ordered_domains:
+            if len(buckets[dom]) == 0:
+                raise ValueError(f'domain bucket {dom!r} is empty; cannot domain-balance')
+        self._buckets = [buckets[d] for d in self._ordered_domains]
+
+        # Effective per-epoch consumption: this sampler yields
+        #   min_bucket_share * num_domains items per rank per epoch, where
+        #   min_bucket_share = min_b (len(b) // dp) after per-bucket floor-div DP shard
+        #   and round-robin truncation to the shortest per-rank slice.
+        # Megatron wraps the loader in cyclic_iter and re-enters __iter__ each
+        # epoch; the epoch counter must advance when consumed_samples reaches
+        # the sampler's actual per-epoch output (NOT the parent's
+        # total_samples - last_batch_size, which counts every dataset row).
+        min_bucket_share = min(len(b) // self.data_parallel_size for b in self._buckets)
+        self.per_rank_len = min_bucket_share * len(self._buckets)
+        if self.per_rank_len == 0:
+            raise ValueError(
+                f'DomainBalancedRandomSampler: some domain bucket has fewer than '
+                f'data_parallel_size={self.data_parallel_size} samples '
+                f'(bucket sizes: {[len(b) for b in self._buckets]}); '
+                f'per-rank effective length is 0.')
+        # per_rank_len must divide by mbs so we don't drop a partial final microbatch
+        # (which would let consumed_samples drift from samples_per_epoch).
+        if self.per_rank_len % self.micro_batch_size != 0:
+            raise ValueError(
+                f'DomainBalancedRandomSampler: per_rank_len={self.per_rank_len} not '
+                f'divisible by micro_batch_size={self.micro_batch_size}; '
+                f'reduce micro_batch_size or ensure each bucket has a compatible size.')
+        # A full epoch on this rank emits per_rank_len indices via per_rank_len/mbs
+        # microbatches, each advancing consumed_samples by mbs*dp -> total dp*per_rank_len.
+        self.samples_per_epoch = self.per_rank_len * self.data_parallel_size
+
+    def __len__(self):
+        return self.total_samples
+
+    def __iter__(self):
+        # Epoch math must use THIS sampler's per-epoch output, not the parent's
+        # active_total_samples — see samples_per_epoch note above.
+        self.epoch = self.consumed_samples // self.samples_per_epoch
+        current_epoch_samples = self.consumed_samples % self.samples_per_epoch
+        assert current_epoch_samples % self.micro_batch_times_data_parallel_size == 0
+
+        if isinstance(self.dataset, RandomSeedDataset):
+            self.dataset.set_epoch(self.epoch)
+
+        # Deterministic per-bucket shuffle. Same seed on every rank so all ranks
+        # see the same permutation of each bucket; contiguous slicing then gives
+        # each rank a disjoint share.
+        shuffled_buckets = []
+        for bucket in self._buckets:
+            if self.shuffle:
+                g = torch.Generator()
+                g.manual_seed(self.epoch)
+                perm = torch.randperm(len(bucket), generator=g).tolist()
+                shuffled_buckets.append([bucket[i] for i in perm])
+            else:
+                shuffled_buckets.append(list(bucket))
+
+        # DP-shard each bucket by contiguous slice (mirrors data_sharding path in
+        # the parent sampler). Drop remainder so every rank has an equal share.
+        per_rank_slices = []
+        for bucket in shuffled_buckets:
+            per_rank = len(bucket) // self.data_parallel_size
+            start = self.data_parallel_rank * per_rank
+            per_rank_slices.append(bucket[start:start + per_rank])
+
+        # Round-robin interleave: every len(buckets) consecutive yielded indices
+        # touch all domains in canonical order. min_len matches the init-time
+        # per_rank_len / num_domains so idx_stream length is deterministic.
+        min_len = self.per_rank_len // len(self._buckets)
+        idx_stream = []
+        for i in range(min_len):
+            for s in per_rank_slices:
+                idx_stream.append(s[i])
+        assert len(idx_stream) == self.per_rank_len, (
+            f'idx_stream length {len(idx_stream)} != expected per_rank_len {self.per_rank_len}')
+
+        # Resume alignment: skip the entries this rank already consumed this epoch.
+        bucket_offset = current_epoch_samples // self.data_parallel_size
+        idx_range = idx_stream[bucket_offset:]
+
+        batch = []
+        for idx in idx_range:
+            batch.append(idx)
+            if len(batch) == self.micro_batch_size:
+                self.consumed_samples += self.micro_batch_times_data_parallel_size
+                yield batch
+                batch = []

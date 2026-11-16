@@ -2,6 +2,7 @@
 import asyncio
 import inspect
 import os
+import time
 from contextlib import nullcontext
 from copy import deepcopy
 from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, Union
@@ -16,6 +17,7 @@ from transformers.utils import is_torch_npu_available
 from swift.llm import InferRequest, Template, TemplateMeta, get_model_tokenizer
 from swift.plugin import Metric
 from swift.utils import get_device, get_dist_setting, get_logger, is_dist
+from ..completion_stream import completion_timing
 from ..protocol import (ChatCompletionResponse, ChatCompletionResponseChoice, ChatCompletionResponseStreamChoice,
                         ChatCompletionStreamResponse, ChatMessage, DeltaMessage, EmbeddingResponse,
                         EmbeddingResponseData, RequestConfig, random_uuid)
@@ -409,6 +411,9 @@ class VllmEngine(InferEngine):
                 logprobs[token_id] = logprob.logprob
         return super()._get_logprobs(logprobs_list, token_ids, top_logprobs)
 
+    def _request_config_for_inputs(self, request_config: RequestConfig, inputs: Dict[str, Any]) -> RequestConfig:
+        return deepcopy(request_config)
+
     def _prepare_generation_config(self, request_config: RequestConfig) -> SamplingParams:
         kwargs = {'max_tokens': request_config.max_tokens}
         for key in ['temperature', 'top_k', 'top_p', 'repetition_penalty']:
@@ -691,7 +696,10 @@ class VllmEngine(InferEngine):
         template: Optional[Template] = None,
         use_tqdm: Optional[bool] = None,
         adapter_request: Optional[AdapterRequest] = None,
+        completion_callback=None,
     ) -> List[Union[ChatCompletionResponse, Iterator[ChatCompletionStreamResponse]]]:
+        if completion_callback is not None and self.use_async_engine:
+            raise ValueError('Complete-response delivery currently requires the synchronous engine.')
         if self.use_async_engine:
             return super().infer(
                 infer_requests,
@@ -703,6 +711,9 @@ class VllmEngine(InferEngine):
             )
         else:
             request_config = deepcopy(request_config or RequestConfig())
+            if completion_callback is not None and (request_config.stream or request_config.n != 1):
+                raise ValueError('Complete-response delivery requires n=1 and no token streaming.')
+            completion_started = time.monotonic() if completion_callback is not None else None
             if request_config.stream and len(infer_requests) > 1:
                 raise ValueError('If you want to use stream batch inference, you need to set use_async_engine to True.')
             if use_tqdm is None:
@@ -715,12 +726,16 @@ class VllmEngine(InferEngine):
             template.set_mode('vllm')
             batched_inputs, error_list = self._batch_encode(
                 infer_requests, template=template, strict=getattr(self, 'strict', True))
+            if completion_callback is not None and error_list:
+                raise ValueError('Complete-response delivery cannot drop failed input encodings.')
             request_id_list = []
             for i, inputs in enumerate(batched_inputs):
-                request_id = str(self._request_count)
+                # Separate synchronous DP engines otherwise all start at "0".
+                # R3 worker exports must identify one globally unique request.
+                request_id = random_uuid() if getattr(self, 'return_routed_experts', False) else str(self._request_count)
                 request_id_list.append(request_id)
                 self._request_count += 1
-                _request_config = deepcopy(request_config)
+                _request_config = self._request_config_for_inputs(request_config, inputs)
                 self.set_default_max_tokens(_request_config, inputs)
                 generation_config = self._prepare_generation_config(_request_config)
                 if generation_config.seed is not None:
@@ -751,13 +766,40 @@ class VllmEngine(InferEngine):
 
                 return [_gen_wrapper()]
             else:
+                request_positions = {request_id: i for i, request_id in enumerate(request_id_list)}
+                first_outputs = {}
                 while self.engine.has_unfinished_requests():
                     step_outputs = self.engine.step()
+                    completed = []
                     for output in step_outputs:
+                        if completion_callback is not None and any(row.token_ids for row in output.outputs):
+                            first_outputs.setdefault(output.request_id, time.monotonic() - completion_started)
                         if output.finished:
-                            outputs[output.request_id] = output
+                            if completion_callback is None:
+                                outputs[output.request_id] = output
+                            else:
+                                if output.request_id in outputs or output.request_id not in request_positions:
+                                    raise RuntimeError('Complete-response engine returned a repeated or unknown request.')
+                                index = request_positions[output.request_id]
+                                response = self._create_chat_completion_response(
+                                    output, batched_inputs[index], template, request_config, output.request_id)
+                                timing = completion_timing(
+                                    output, elapsed_seconds=time.monotonic() - completion_started,
+                                    first_output_seconds=first_outputs.get(output.request_id))
+                                completed.append((index, response, timing))
+                                # Release raw outputs after delivery; do not retain
+                                # the entire window's token/logprob objects here.
+                                outputs[output.request_id] = None
                             prog_bar.update()
+                    if completed:
+                        # The callback (including R3 export) stays on the engine
+                        # owner thread, between native scheduler steps.
+                        completion_callback(completed)
                 prog_bar.close()
+                if completion_callback is not None:
+                    if set(outputs) != set(request_id_list):
+                        raise RuntimeError('Complete-response engine did not finish every selected request.')
+                    return []
                 outputs = [outputs[request_id] for request_id in request_id_list]
                 res = [
                     self._create_chat_completion_response(result, inputs, template, request_config, request_id)
@@ -785,6 +827,7 @@ class VllmEngine(InferEngine):
         loop = asyncio.get_running_loop()
         with torch.inference_mode():
             inputs = await loop.run_in_executor(None, template.encode, infer_request, True)
+        request_config = self._request_config_for_inputs(request_config, inputs)
         self.set_default_max_tokens(request_config, inputs)
         generation_config = self._prepare_generation_config(request_config)
         self._add_stop_words(generation_config, request_config, template.template_meta)

@@ -8,6 +8,7 @@ from PIL import Image
 
 from swift.utils import get_logger
 from ..utils import Messages, Tool, messages_to_history
+from .image_budget import image_pixel_budget
 from .utils import get_last_user_round
 
 logger = get_logger()
@@ -57,9 +58,9 @@ class InferRequest:
     """
     messages: Messages
 
-    images: List[Union[str, Image.Image]] = field(default_factory=list)
+    images: List[Union[str, Image.Image, Dict[str, Any]]] = field(default_factory=list)
     audios: List[str] = field(default_factory=list)
-    videos: List[str] = field(default_factory=list)
+    videos: List[Union[str, List[str]]] = field(default_factory=list)
 
     tools: Optional[List[Tool]] = None
     objects: Dict[str, Any] = field(default_factory=dict)
@@ -126,7 +127,7 @@ class RolloutInferRequest(InferRequest):
         uuid (Optional[str]):
             Optional unique identifier for this request instance.
     """
-    images: List[str] = field(default_factory=list)
+    images: List[Union[str, Dict[str, Any]]] = field(default_factory=list)
     data_dict: Dict = field(default_factory=dict)
     uuid: Optional[str] = None
 
@@ -142,7 +143,7 @@ class StdTemplateInputs:
     label: Optional[int] = None
     channel: Optional[str] = None
 
-    images: List[Union[str, Image.Image]] = field(default_factory=list)
+    images: List[Union[str, Image.Image, Dict[str, Any]]] = field(default_factory=list)
     videos: List[str] = field(default_factory=list)
     audios: List[str] = field(default_factory=list)
     objects: Dict[str, Any] = field(default_factory=dict)
@@ -246,6 +247,10 @@ class StdTemplateInputs:
                 if isinstance(value, dict):
                     value = value['url']
                 if value:
+                    if key == 'image':
+                        budget = image_pixel_budget(item)
+                        if budget:
+                            value = {'path': value, **budget}
                     res[f'{key}s'].append(value)
             message['content'] = new_content
         return res

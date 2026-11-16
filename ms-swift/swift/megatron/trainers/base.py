@@ -2,6 +2,7 @@
 import collections
 import logging
 import os
+import re
 import shutil
 import time
 from abc import ABC, abstractmethod
@@ -42,8 +43,8 @@ from swift.trainers import SwiftMixin
 from swift.utils import JsonlWriter, deep_getattr, format_time, get_last_valid_indices, get_logger, ms_logger_context
 from ..tuners import LoraParallelLinear
 from ..utils import adapter_state_dict_context, copy_original_module_weight, patch_merge_fn, prepare_mcore_model
-from .utils import (MegatronPretrainingRandomSampler, get_batch_on_this_cp_rank, get_batch_on_this_tp_rank,
-                    get_packed_seq_params, get_swift_datasets_provider)
+from .utils import (DomainBalancedRandomSampler, MegatronPretrainingRandomSampler, get_batch_on_this_cp_rank,
+                    get_batch_on_this_tp_rank, get_packed_seq_params, get_swift_datasets_provider)
 
 try:
     from megatron.training.datasets.data_samplers import MegatronPretrainingSampler
@@ -56,6 +57,69 @@ except ImportError:
     param_group_identifier_keys = None
 
 logger = get_logger()
+
+# checkpoint dir like 'checkpoint-1000', optimizer-state subdir like 'iter_0001000'
+_CHECKPOINT_DIR_RE = re.compile(r'^checkpoint-(\d+)$')
+_ITER_DIR_RE = re.compile(r'^iter_\d+$')
+
+
+def _prune_old_optimizer_states(save_dir: str, current_iteration: int) -> List[str]:
+    """Delete the heavy ``iter_*/`` optimizer-state subdir of every checkpoint except the
+    just-saved ``checkpoint-<current_iteration>``.
+
+    The HF inference weights (``model-*.safetensors`` etc.) of all checkpoints are kept;
+    only the distcp optimizer/RNG/scheduler state of non-latest checkpoints is removed, so
+    after each save exactly one ``iter_*/`` remains on disk (the newest one).
+
+    This is a standalone, distribution-free helper so it can be unit-tested without a live
+    trainer. The caller is responsible for guarding it to rank 0. Returns the list of
+    optimizer-state paths that were successfully deleted.
+
+    Safety (mirrors Megatron ``delete_checkpoint``):
+      - never touches ``save_dir`` itself or any safetensors file;
+      - only deletes paths matching ``checkpoint-<digits>/iter_<digits>``;
+      - realpath-asserts the target lives inside ``realpath(save_dir)``;
+      - skips symlinks; wraps each rmtree in try/except (failure is non-fatal).
+    """
+    deleted: List[str] = []
+    try:
+        entries = os.listdir(save_dir)
+    except OSError as e:
+        logger.warning(f'[ckpt-prune] could not list {save_dir}: {e}')
+        return deleted
+    real_save_dir = os.path.realpath(save_dir)
+    keep_name = f'checkpoint-{current_iteration}'
+    for name in entries:
+        match = _CHECKPOINT_DIR_RE.match(name)
+        if match is None or name == keep_name:
+            continue
+        ckpt_dir = os.path.join(save_dir, name)
+        if not os.path.isdir(ckpt_dir) or os.path.islink(ckpt_dir):
+            continue
+        try:
+            iter_names = os.listdir(ckpt_dir)
+        except OSError as e:
+            logger.warning(f'[ckpt-prune] could not list {ckpt_dir}: {e}')
+            continue
+        for iter_name in iter_names:
+            if _ITER_DIR_RE.match(iter_name) is None:
+                continue
+            iter_dir = os.path.join(ckpt_dir, iter_name)
+            # Never follow symlinks; never delete safetensors or a non-directory.
+            if os.path.islink(iter_dir) or not os.path.isdir(iter_dir):
+                continue
+            real_iter_dir = os.path.realpath(iter_dir)
+            # Defensive: the resolved target must stay under save_dir and never BE save_dir.
+            if real_iter_dir == real_save_dir or not real_iter_dir.startswith(real_save_dir + os.sep):
+                logger.warning(f'[ckpt-prune] refusing to delete out-of-tree path {iter_dir}')
+                continue
+            try:
+                shutil.rmtree(iter_dir)
+                deleted.append(iter_dir)
+                logger.info(f'[ckpt-prune] removed optimizer state {iter_dir} (kept safetensors)')
+            except Exception as e:  # non-fatal: log and continue, like Megatron delete_checkpoint
+                logger.warning(f'[ckpt-prune] failed to remove optimizer state {iter_dir}: {e}')
+    return deleted
 
 
 class BaseMegatronTrainer(ABC):
@@ -72,6 +136,16 @@ class BaseMegatronTrainer(ABC):
         logger.info(f'logging_path: {logging_path}')
         self.jsonl_writer = JsonlWriter(logging_path, enable_async=True, write_on_rank='last')  # for evaluate
         self._patch_megatron()
+
+        # Early stopping parameters. early_stopping_patience is only declared on
+        # MegatronRLHFArguments; plain `megatron sft` uses MegatronTrainArguments
+        # which lacks it, so default to 0 (disabled) to keep this shared base
+        # trainer usable from both the SFT and RLHF paths.
+        self.early_stopping_patience: int = getattr(args, 'early_stopping_patience', 0)
+        self.best_validation_loss: float = float('inf')
+        self.patience_counter: int = 0
+        self.early_stopping_triggered: bool = False
+
 
         if args.check_model and hasattr(args, 'model_info') and hasattr(args.model_info, 'model_dir'):
             with ms_logger_context(logging.CRITICAL), self._patch_timeout():
@@ -514,6 +588,19 @@ class BaseMegatronTrainer(ABC):
         if args.is_multimodal:
             for m in self.unwrapped_models:
                 self._prepare_vit_gradient_checkpointing(m)
+        if self.args.mopd_router_replay != 'disabled':
+            from .router_replay import install_student_router_replay
+            self._router_replay_sessions = []
+            for m in self.unwrapped_models:
+                self._router_replay_sessions.append(
+                    install_student_router_replay(m, self.args.mopd_router_replay))
+        if self.args.mopd_train_flash_attention_version == '2':
+            from .attention_backend import force_native_flash_attention_v2
+            attention_models = list(self.unwrapped_models)
+            for group in getattr(self, 'teacher_groups', ()):
+                attention_models.extend(group)
+            count = sum(force_native_flash_attention_v2(model) for model in attention_models)
+            logger.info(f'MOPD native train/teacher FlashAttention v2 selected for {count} modules.')
         return model, optimizer, opt_param_scheduler
 
     def _prepare_vit_gradient_checkpointing(self, model):
@@ -562,8 +649,25 @@ class BaseMegatronTrainer(ABC):
     def train_step(self, forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, *args,
                    **kwargs):
         new_data_iterator = self._replace_data_iterator(data_iterator, model)
-        return self._origin_train_step(forward_step_func, new_data_iterator, model, optimizer, opt_param_scheduler,
-                                       config, *args, **kwargs)
+        scheduled_microbatches = getattr(self, '_scheduled_num_microbatches', None)
+        if scheduled_microbatches is not None:
+            kwargs['num_microbatches_override'] = scheduled_microbatches
+        if self.args.use_sft_loss:
+            kwargs['sft_data_iterator'] = data_iterator
+        result = self._origin_train_step(forward_step_func, new_data_iterator, model, optimizer, opt_param_scheduler,
+                                         config, *args, **kwargs)
+
+        sessions = getattr(self, '_router_replay_sessions', ())
+        if sessions:
+            routing_stats = {}
+            for session in sessions:
+                for key, value in session.stats(reset=True).items():
+                    routing_stats[key] = routing_stats.get(key, 0) + value
+            self._last_router_replay_stats = routing_stats
+            writer = get_wandb_writer()
+            if writer is not None:
+                writer.log(routing_stats, step=int(get_args().curr_iteration) + 1)
+        return result
 
     # Code borrowed from NVIDIA/Megatron-LM
     def evaluate(
@@ -580,6 +684,12 @@ class BaseMegatronTrainer(ABC):
         """Evaluation."""
         args = get_args()
         timers = get_timers()
+
+        # Eval-boundary teacher cleanup: MOPD body-reuse can leave a teacher
+        # resident on GPU from the previous train step. Offload it before eval
+        # forward so it doesn't stack on top of the student's memory and OOM.
+        if hasattr(self, '_offload_resident_teacher_if_any'):
+            self._offload_resident_teacher_if_any()
 
         timers('evaluate', log_level=0).start(barrier=True)
         if args.vision_pretraining and args.vision_pretraining_type == 'dino':
@@ -623,12 +733,16 @@ class BaseMegatronTrainer(ABC):
                 # Don't care about timing during evaluation
                 config.timers = None
                 ft_integration.on_eval_step_start()
-                new_data_iterator = self._replace_data_iterator(data_iterator, model)
+                self._eval_num_microbatches = eval_num_microbatches
+                try:
+                    new_data_iterator = self._replace_data_iterator(data_iterator, model)
+                finally:
+                    self._eval_num_microbatches = None
                 loss_dicts = forward_backward_func(
                     forward_step_func=forward_step_func,
                     data_iterator=new_data_iterator,
                     model=model,
-                    num_microbatches=eval_num_microbatches,
+                    num_microbatches=(getattr(self, '_scheduled_num_microbatches', None) or eval_num_microbatches),
                     seq_length=args.seq_length,
                     micro_batch_size=args.micro_batch_size,
                     decoder_seq_length=args.decoder_seq_length,
@@ -707,6 +821,31 @@ class BaseMegatronTrainer(ABC):
             numerator, denominator = total_loss_dict[key]
             total_loss_dict[key] = numerator / denominator
 
+        # Early Stopping Logic
+        # Assuming the main validation metric is 'jsd_loss' or 'loss'
+        eval_loss = total_loss_dict.get('jsd_loss', total_loss_dict.get('loss', None))
+        early_exit_flag = False
+
+        if eval_loss is not None and self.early_stopping_patience > 0:
+            if eval_loss < self.best_validation_loss:
+                self.best_validation_loss = eval_loss
+                self.patience_counter = 0
+                logger.info_if(
+                    f'Validation loss improved to {self.best_validation_loss:.6f}. Resetting patience.',
+                    cond=is_last_rank()
+                )
+            else:
+                self.patience_counter += 1
+                logger.info_if(
+                    f'Validation loss did not improve. Patience: {self.patience_counter}/{self.early_stopping_patience}.',
+                    cond=is_last_rank()
+                )
+
+            if self.patience_counter >= self.early_stopping_patience:
+                self.early_stopping_triggered = True
+                early_exit_flag = True
+                logger.info_if('Early stopping triggered due to no improvement in validation loss.', cond=is_last_rank())
+
         timers('evaluate').stop()
         timers.log(['evaluate'])
         self.custom_log(total_loss_dict, 'eval')
@@ -716,7 +855,11 @@ class BaseMegatronTrainer(ABC):
             for key, val in total_loss_dict.items():
                 logs[f'eval_{key}'] = round(val.item(), 8)
             self.jsonl_writer.append(logs)
-        return total_loss_dict, collected_non_loss_data, False
+        # 3rd tuple slot is the genuine early-exit signal only. Do NOT OR in
+        # args.exit_duration_in_mins — that's a threshold (minutes / None), not
+        # a should-exit boolean, and OR-ing it terminated training after every
+        # eval whenever the duration cap was configured.
+        return total_loss_dict, collected_non_loss_data, early_exit_flag
 
     def _get_metrics(self, total_loss_dict, mode):
         advanced_iters = total_loss_dict['advanced iterations'] if mode == 'train' else 1
@@ -947,11 +1090,20 @@ class BaseMegatronTrainer(ABC):
             else:
                 assert decoupled_learning_rate is None
             log_string += f' global batch size: {batch_size:5d} |'
+            # Delete (not zero) per-key entries at flush. Dense keys (loss,
+            # jsd_loss) are present every step and re-accumulate from loss_dict
+            # next step; sparse diagnostics (divergence/*, logged
+            # only every diagnostics_interval steps) must NOT linger as a stale
+            # 0.0 between collect steps -- that would read as a sudden drop to
+            # zero in the logged series. Deleting yields a true gap instead.
+            keys_to_clear = []
             for key in total_loss_dict:
                 if key not in [advanced_iters_key, skipped_iters_key, nan_iters_key]:
                     avg = total_loss_dict[key].item() / float(max(1, total_loss_dict[advanced_iters_key]))
                     log_string += ' {}: {:.6E} |'.format(key, avg)
-                    total_loss_dict[key] = torch.tensor([0.0], dtype=torch.float, device='cuda')
+                    keys_to_clear.append(key)
+            for key in keys_to_clear:
+                del total_loss_dict[key]
             log_string += f' loss scale: {loss_scale:.1f} |'
             if grad_norm is not None:
                 log_string += f' grad norm: {grad_norm:.3f} |'
@@ -977,10 +1129,24 @@ class BaseMegatronTrainer(ABC):
             if is_last_rank():
                 logs = {}
                 for key in origin_total_loss_dict:
-                    if key not in [advanced_iters_key, skipped_iters_key, nan_iters_key]:
-                        avg = origin_total_loss_dict[key].item() / float(
-                            max(1, origin_total_loss_dict[advanced_iters_key]))
-                        logs[key] = round(avg, 8)
+                    if key in [advanced_iters_key, skipped_iters_key, nan_iters_key]:
+                        continue
+                    # Trim the fine-grained distillation diagnostics from logging.jsonl;
+                    # a configured tracker backend still receives them via custom_log /
+                    # the loss_dict loop above.
+                    # Keep only the load-bearing scalars: the losses (`loss`,
+                    # `jsd_loss`, `sft_loss`, `load_balancing_loss`) and the single
+                    # core distillation health signal `divergence/top1_agreement`.
+                    # Drop everything under loss/*, efficiency/*, and the rest of
+                    # divergence/* -- those are per-step noise, best read fine-grained
+                    # in a tracker backend when one is configured.
+                    if key.startswith(('loss/', 'efficiency/')):
+                        continue
+                    if key.startswith('divergence/') and key != 'divergence/top1_agreement':
+                        continue
+                    avg = origin_total_loss_dict[key].item() / float(
+                        max(1, origin_total_loss_dict[advanced_iters_key]))
+                    logs[key] = round(avg, 8)
                 if grad_norm is not None:
                     logs['grad_norm'] = round(grad_norm, 8)
                 if params_norm is not None:
@@ -1048,6 +1214,27 @@ class BaseMegatronTrainer(ABC):
             self.bridge.save_weights(self.unwrapped_models, output_dir, is_peft_format=save_peft_format)
             if args.train_type == 'lora' and args.merge_lora:
                 self.unmerge_lora_adapters()
+        if not getattr(args, 'mopd_prune_old_optimizer_states', False):
+            return
+        # Optionally prune optimizer state of every other checkpoint while
+        # retaining their safetensors inference weights.
+        # Distcp save is collective; deletion must be done by a single rank to avoid races.
+        #
+        # async_save hazard: with args.async_save=True, _origin_save_checkpoint returns BEFORE
+        # the async distcp IO and finalizer callbacks (tracker file + actual file writes) have
+        # completed. A plain barrier() only syncs ranks, not the in-flight async writers, so
+        # pruning here could delete a previous checkpoint's iter_*/ while its writer/finalizer
+        # is still active (or race the current save). Block on Megatron's async finalizer first;
+        # it is a no-op when async_save is off (it early-returns on args.async_save internally).
+        if getattr(args, 'async_save', False):
+            from megatron.training.async_utils import maybe_finalize_async_save
+            maybe_finalize_async_save(blocking=True)
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+            if torch.distributed.get_rank() == 0:
+                _prune_old_optimizer_states(origin_save, iteration)
+        else:
+            _prune_old_optimizer_states(origin_save, iteration)
 
     def _patch_megatron(self):
         # support max_epochs
@@ -1145,17 +1332,46 @@ class BaseMegatronTrainer(ABC):
                 data_parallel_size=mpu.get_data_parallel_world_size(),
             )
         elif args.dataloader_type == 'cyclic':
-            batch_sampler = MegatronPretrainingRandomSampler(
-                dataset,
-                total_samples=len(dataset),
-                consumed_samples=consumed_samples,
-                micro_batch_size=args.micro_batch_size,
-                data_parallel_rank=mpu.get_data_parallel_rank(),
-                data_parallel_size=mpu.get_data_parallel_world_size(),
-                data_sharding=args.data_sharding,
-                shuffle=args.train_dataloader_shuffle,
-                group_by_length=args.group_by_length,
-            )
+            if getattr(args, 'mopd_domain_balanced_sampler', False) and getattr(args, 'teacher_models', None):
+                # Strict per-global-batch 1:1 requires each rank's per-step share
+                # (global_batch_size / dp) to be a multiple of num_domains. The
+                # round-robin sampler is phase-aligned (every rank starts at
+                # domain 0), so a non-multiple share would silently break the
+                # equal-share invariant this sampler provides.
+                dp_size = mpu.get_data_parallel_world_size()
+                num_domains = len(args.domain_teacher_mapping)
+                if (args.global_batch_size // dp_size) % num_domains != 0:
+                    raise ValueError(
+                        f'mopd_domain_balanced_sampler requires (global_batch_size / data_parallel_size) '
+                        f'to be a multiple of num_domains={num_domains} for strict per-global-batch 1:1, '
+                        f'but global_batch_size={args.global_batch_size}, data_parallel_size={dp_size} '
+                        f'-> per-rank step {args.global_batch_size // dp_size} is not divisible by '
+                        f'{num_domains}. Set GLOBAL_BATCH_SIZE so that (GBS / DP) % {num_domains} == 0 '
+                        f'(e.g. GBS=144 at DP=8).')
+                batch_sampler = DomainBalancedRandomSampler(
+                    dataset,
+                    total_samples=len(dataset),
+                    consumed_samples=consumed_samples,
+                    micro_batch_size=args.micro_batch_size,
+                    data_parallel_rank=mpu.get_data_parallel_rank(),
+                    data_parallel_size=mpu.get_data_parallel_world_size(),
+                    data_sharding=args.data_sharding,
+                    shuffle=args.train_dataloader_shuffle,
+                    group_by_length=args.group_by_length,
+                    domain_teacher_mapping=args.domain_teacher_mapping,
+                )
+            else:
+                batch_sampler = MegatronPretrainingRandomSampler(
+                    dataset,
+                    total_samples=len(dataset),
+                    consumed_samples=consumed_samples,
+                    micro_batch_size=args.micro_batch_size,
+                    data_parallel_rank=mpu.get_data_parallel_rank(),
+                    data_parallel_size=mpu.get_data_parallel_world_size(),
+                    data_sharding=args.data_sharding,
+                    shuffle=args.train_dataloader_shuffle,
+                    group_by_length=args.group_by_length,
+                )
         else:
             raise Exception('{} dataloader type is not supported.'.format(args.dataloader_type))
 
@@ -1191,6 +1407,9 @@ class BaseMegatronTrainer(ABC):
         pass
 
     def _prepare_batch(self, data, vp_stage=None, num_samples=None):
+        # RerunDataIterator returns its saved object again on replay. Mutating
+        # keys/rolling labels must not consume or shift that saved batch.
+        data = dict(data)
         batch = get_batch_on_this_tp_rank(data, vp_stage=vp_stage)
         if num_samples is None:
             num_samples = batch.pop('num_samples')

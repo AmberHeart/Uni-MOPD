@@ -263,6 +263,11 @@ def save_checkpoint(model: Optional[PreTrainedModel],
             copy_files_by_pattern(model.model_dir, output_dir, '*.py')
             copy_files_by_pattern(model.model_dir, output_dir, '*.json')
     processor.save_pretrained(output_dir)
+    generation_config = getattr(model, 'generation_config', None)
+    if generation_config is not None:
+        # Keep runtime changes authoritative, including custom model savers
+        # that do not persist their generation configuration themselves.
+        generation_config.save_pretrained(output_dir)
 
     if model_dirs is None:
         model_dirs = []
@@ -270,9 +275,13 @@ def save_checkpoint(model: Optional[PreTrainedModel],
         model_dirs = model_dirs.copy()
     if model and model.model_dir and model.model_dir not in model_dirs:
         model_dirs.append(model.model_dir)
-    for src_file in (additional_saved_files or []) + ['preprocessor_config.json', 'args.json']:
+    for src_file in (additional_saved_files or []) + [
+            'generation_config.json', 'preprocessor_config.json', 'args.json']:
         tgt_path = os.path.join(output_dir, src_file)
-        if os.path.exists(tgt_path) and src_file == 'args.json':
+        # Megatron exports weights/config separately and calls this with
+        # model=None. In that path copy the complete source generation config,
+        # but never replace one already saved by a model with stale defaults.
+        if os.path.exists(tgt_path) and src_file in {'args.json', 'generation_config.json'}:
             continue
         for model_dir in model_dirs:
             src_path: str = os.path.join(model_dir, src_file)

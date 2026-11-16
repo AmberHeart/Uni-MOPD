@@ -1,0 +1,384 @@
+diff --git a/megatron/core/model_parallel_config.py b/megatron/core/model_parallel_config.py
+index 2758c9c07..62d3d9404 100644
+--- a/megatron/core/model_parallel_config.py
++++ b/megatron/core/model_parallel_config.py
+@@ -1,5 +1,6 @@
+ # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+ 
++import warnings
+ from dataclasses import dataclass
+ from typing import Callable, ContextManager, Optional
+ 
+diff --git a/megatron/core/transformer/moe/moe_utils.py b/megatron/core/transformer/moe/moe_utils.py
+index dc8571298..5dd77512f 100644
+--- a/megatron/core/transformer/moe/moe_utils.py
++++ b/megatron/core/transformer/moe/moe_utils.py
+@@ -529,6 +529,7 @@ def topk_routing_with_score_function(
+     score_function: str = "softmax",
+     expert_bias: Optional[torch.Tensor] = None,
+     fused: bool = False,
++    routing_replay=None,
+ ):
+     """Compute the routing probabilities and map for top-k selection with score function.
+     Args:
+@@ -551,6 +552,8 @@ def topk_routing_with_score_function(
+     assert logits.dim() == 2, f"Expected 2D logits [num_tokens, num_experts], got {logits.dim()}."
+     num_tokens, num_experts = logits.shape
+     if fused:
++        if routing_replay is not None:
++            raise ValueError("Routing replay requires moe_router_fusion=False.")
+         if not HAVE_TE or fused_topk_with_score_function is None:
+             raise ValueError(
+                 "fused_topk_with_score_function is not available. Please install TE >= 2.6.0."
+@@ -566,7 +569,7 @@ def topk_routing_with_score_function(
+             expert_bias=expert_bias,
+         )
+ 
+-    def compute_topk(scores, topk, num_groups=None, group_topk=None):
++    def natural_topk(scores, topk):
+         if group_topk:
+             return group_limited_topk(
+                 scores=scores,
+@@ -579,6 +582,11 @@ def topk_routing_with_score_function(
+         else:
+             return torch.topk(scores, k=topk, dim=1)
+ 
++    def compute_topk(scores, topk, num_groups=None, group_topk=None):
++        if routing_replay is not None:
++            return routing_replay.topk(scores, topk, natural_topk)
++        return natural_topk(scores, topk)
++
+     if score_function == "softmax":
+         if use_pre_softmax:
+             scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
+diff --git a/megatron/core/transformer/moe/router.py b/megatron/core/transformer/moe/router.py
+index 068d680c7..926db5cd7 100644
+--- a/megatron/core/transformer/moe/router.py
++++ b/megatron/core/transformer/moe/router.py
+@@ -154,6 +154,9 @@ class TopKRouter(Router):
+         self.routing_type = self.config.moe_router_load_balancing_type
+         self.score_function = self.config.moe_router_score_function
+         self.input_jitter = None
++        # Installed only on the student, with a fresh frame for each microbatch.
++        # Teachers and ordinary SFT/OPD retain the native selection path.
++        self.routing_replay = None
+ 
+         self.enable_expert_bias = self.config.moe_router_enable_expert_bias
+         if self.enable_expert_bias:
+@@ -497,6 +500,7 @@ class TopKRouter(Router):
+                 score_function=self.score_function,
+                 expert_bias=self.expert_bias,
+                 fused=self.config.moe_router_fusion,
++                routing_replay=self.routing_replay,
+             )
+ 
+         # Apply token dropping to probs and routing_map.
+@@ -516,6 +520,11 @@ class TopKRouter(Router):
+             routing_map_for_aux_loss, scores_for_aux_loss = compute_routing_scores_for_aux_loss(
+                 logits, self.topk, self.score_function, fused=self.config.moe_router_fusion
+             )
++            if self.routing_replay is not None:
++                # Count the experts actually used by this forward. Otherwise
++                # recomputation could attach an aux loss for a different route
++                # even after the main branch correctly replayed its IDs.
++                routing_map_for_aux_loss = routing_map
+             probs = self._apply_aux_loss(probs, scores_for_aux_loss, routing_map_for_aux_loss)
+             probs = self._apply_seq_aux_loss(
+                 probs, scores_for_aux_loss, routing_map_for_aux_loss, seq_length, bsz
+diff --git a/megatron/training/checkpointing.py b/megatron/training/checkpointing.py
+index da173912d..3e884ed8b 100644
+--- a/megatron/training/checkpointing.py
++++ b/megatron/training/checkpointing.py
+@@ -314,8 +314,14 @@ def get_rng_state(ckpt_format: str):
+         'cuda_rng_state': torch.cuda.get_rng_state(),
+         'rng_tracker_states': tensor_parallel.get_cuda_rng_tracker().get_states()}
+ 
++    # MoE expert streams differ across dense-DP ranks even with identical
++    # initialization seeds. torch_dist stores only one DP replica of this
++    # object, so collect those streams before replica deduplication.
++    per_dp_rng = args.data_parallel_random_init or (
++        ckpt_format == "torch_dist" and mpu.get_expert_model_parallel_world_size() > 1
++    )
+     rng_state_list = None
+-    if args.data_parallel_random_init and torch.distributed.is_initialized() and \
++    if per_dp_rng and torch.distributed.is_initialized() and \
+             mpu.get_data_parallel_world_size() > 1:
+         rng_state_list = \
+             [None for i in range(mpu.get_data_parallel_world_size())]
+@@ -342,6 +348,25 @@ def get_rng_state(ckpt_format: str):
+ 
+     return rng_state_list
+ 
++
++def _select_rng_state(rng_state_list, ckpt_format: str):
++    """Select the saved RNG for this rank without inventing missing expert state."""
++    per_dp_rng = get_args().data_parallel_random_init or (
++        ckpt_format == "torch_dist" and mpu.get_expert_model_parallel_world_size() > 1
++    )
++    if per_dp_rng:
++        expected = mpu.get_data_parallel_world_size()
++        if len(rng_state_list) != expected:
++            raise RuntimeError(
++                f"Checkpoint has {len(rng_state_list)} RNG states for {expected} data-parallel ranks. "
++                "A lossless resume requires per-rank expert RNG states and the saved parallel layout. "
++                "Older MoE torch_dist checkpoints may have discarded these states. "
++                "Use --no-load-rng only if intentionally accepting a non-reproducible continuation."
++            )
++        return rng_state_list[mpu.get_data_parallel_rank()]
++    return rng_state_list[0]
++
++
+ class CheckpointType(Enum):
+     LEGACY = auto()
+     LOCAL = auto()
+@@ -1670,11 +1695,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load',
+                 else:
+                     rng_state = state_dict['rng_state']
+ 
+-                # access rng_state for data parallel rank
+-                if args.data_parallel_random_init:
+-                    rng_state = rng_state[mpu.get_data_parallel_rank()]
+-                else:
+-                    rng_state = rng_state[0]
++                rng_state = _select_rng_state(rng_state, ckpt_format)
+                 random.setstate(rng_state['random_rng_state'])
+                 np.random.set_state(rng_state['np_rng_state'])
+                 torch.set_rng_state(rng_state['torch_rng_state'])
+diff --git a/megatron/training/initialize.py b/megatron/training/initialize.py
+index 1e14926a2..9770ba573 100644
+--- a/megatron/training/initialize.py
++++ b/megatron/training/initialize.py
+@@ -364,9 +364,9 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
+                 use_sharp=args.use_sharp,
+                 context_parallel_size=args.context_parallel_size,
+                 hierarchical_context_parallel_sizes=args.hierarchical_context_parallel_sizes,
+-                expert_model_parallel_size=args.expert_model_parallel_size,
++                expert_model_parallel_size=args._original_ep_size if hasattr(args, '_original_ep_size') else args.expert_model_parallel_size,
+                 num_distributed_optimizer_instances=args.num_distributed_optimizer_instances,
+-                expert_tensor_parallel_size=args.expert_tensor_parallel_size,
++                expert_tensor_parallel_size=args._original_etp_size if hasattr(args, '_original_etp_size') else args.expert_tensor_parallel_size,
+                 distributed_timeout_minutes=args.distributed_timeout_minutes,
+                 nccl_communicator_config_path=args.nccl_communicator_config_path,
+                 order='tp-cp-ep-dp-pp' if not args.use_tp_pp_dp_mapping else 'tp-cp-ep-pp-dp',
+diff --git a/megatron/training/training.py b/megatron/training/training.py
+index b63636710..08ec24603 100644
+--- a/megatron/training/training.py
++++ b/megatron/training/training.py
+@@ -47,6 +47,24 @@ except ImportError:
+     CallWrapper = type(None)
+ 
+ 
++# MOPD: extra early-trend checkpoints via env, non-invasive to Megatron args.
++# Parse MOPD_EXTRA_SAVE_ITERS (comma-separated iteration ints) ONCE at import;
++# empty/unset/malformed -> feature OFF (identical behavior to upstream).
++def _mopd_parse_extra_save_iters():
++    raw = os.environ.get("MOPD_EXTRA_SAVE_ITERS", "")
++    if not raw:
++        return frozenset()
++    try:
++        return frozenset(
++            int(tok) for tok in raw.split(",") if tok.strip()
++        )
++    except (ValueError, TypeError):
++        return frozenset()
++
++
++_MOPD_EXTRA_SAVE_ITERS = _mopd_parse_extra_save_iters()
++
++
+ from megatron.core import mpu, tensor_parallel
+ from megatron.core.utils import (
+     check_param_hashes_across_dp_replicas,
+@@ -803,7 +821,14 @@ def pretrain(
+ 
+     wandb_writer = get_wandb_writer()
+     if wandb_writer:
+-        wandb_writer.finish()
++        # Training is complete and checkpoints are saved by this point, so a
++        # crash inside the experiment logger's own shutdown must not fail the
++        # run or change the process exit code.
++        try:
++            wandb_writer.finish()
++        except Exception as e:
++            print_rank_0(f'[MOPD] experiment logger finish() failed during shutdown '
++                         f'(training already completed, checkpoints saved); ignoring: {e}')
+ 
+     ft_integration.on_checkpointing_start()
+     maybe_finalize_async_save(blocking=True, terminate=True)
+@@ -1236,7 +1261,7 @@ def dummy_train_step(data_iterator):
+             batch = get_batch_on_this_cp_rank(batch)
+ 
+ 
+-def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func):
++def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, sft_data_iterator=None, num_microbatches_override=None):
+     """Single training step."""
+     args = get_args()
+     timers = get_timers()
+@@ -1267,9 +1292,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
+         # Forward pass.
+         losses_reduced = forward_backward_func(
+             forward_step_func=forward_step_func,
+-            data_iterator=data_iterator,
++            data_iterator=(data_iterator, sft_data_iterator) if sft_data_iterator is not None else data_iterator,
+             model=model,
+-            num_microbatches=get_num_microbatches(),
++            # Execution padding does not change the real sample count used by
++            # the scheduler below or the outer training loop.
++            num_microbatches=(get_num_microbatches() if num_microbatches_override is None
++                             else num_microbatches_override),
+             seq_length=args.seq_length,
+             micro_batch_size=args.micro_batch_size,
+             decoder_seq_length=args.decoder_seq_length,
+@@ -1895,6 +1923,23 @@ def checkpoint_and_decide_exit(
+         )
+         saved_checkpoint = True
+ 
++    # MOPD: extra early-trend checkpoints via env, non-invasive to Megatron args.
++    if (
++        args.save
++        and not saved_checkpoint
++        and iteration in _MOPD_EXTRA_SAVE_ITERS
++    ):
++        save_checkpoint_and_time(
++            iteration,
++            model,
++            optimizer,
++            opt_param_scheduler,
++            num_floating_point_operations_so_far,
++            checkpointing_context,
++            train_data_iterator=train_data_iterator,
++        )
++        saved_checkpoint = True
++
+     # Exit based on duration.
+     if args.exit_duration_in_mins:
+         train_time = (time.time() - _TRAIN_START_TIME) / 60.0
+@@ -2489,7 +2534,12 @@ def train(
+     if should_exit:
+         wandb_writer = get_wandb_writer()
+         if wandb_writer:
+-            wandb_writer.finish()
++            # See note above: a logger-shutdown crash must not override exit_code.
++            try:
++                wandb_writer.finish()
++            except Exception as e:
++                print_rank_0(f'[MOPD] experiment logger finish() failed during shutdown '
++                             f'(training already completed, checkpoints saved); ignoring: {e}')
+         ft_integration.shutdown()
+         one_logger_utils.finish()
+         sys.exit(exit_code)
+diff --git a/megatron/core/transformer/moe/routing_replay.py b/megatron/core/transformer/moe/routing_replay.py
+new file mode 100644
+index 000000000..1b54ad61f
+--- /dev/null
++++ b/megatron/core/transformer/moe/routing_replay.py
+@@ -0,0 +1,109 @@
++# Copyright (c) 2026, Uni-MOPD contributors.
++# SPDX-License-Identifier: Apache-2.0
++"""Per-layer, per-microbatch expert-ID replay; native gate scores stay live.
++
++The frame belongs to one student router, never to a process-global registry.
++Keep it alive until that microbatch's backward/recomputation has finished.
++Replacing the frame at the next microbatch also releases its retained indices.
++"""
++from typing import Callable, Optional
++
++import torch
++
++
++class RoutingReplayFrame:
++    """Record natural training routes (R2) or replay rollout routes (R3).
++
++    ``forced_indices`` may leave rows at -1 for tokens not forwarded by the
++    rollout engine, such as the final sampled token and training-only padding.
++    Such rows use natural routing on the initial forward, and replay THAT
++    choice on recomputation. Partially specified top-k rows are invalid.
++    """
++
++    def __init__(self, forced_indices: Optional[torch.Tensor] = None, *, check_recompute: bool = False):
++        self.forced_indices = forced_indices
++        self.recorded_indices = None
++        self.forward_calls = 0
++        self.replay_calls = 0
++        self.forced_tokens = 0
++        self.changed_tokens = None
++        self.check_recompute = check_recompute
++        self.recompute_changed_tokens = None
++
++    def topk(self, scores: torch.Tensor, topk: int, natural_topk: Callable):
++        """Select IDs only; gathering current scores preserves gate gradients."""
++        if self.recorded_indices is not None:
++            indices = self.recorded_indices
++            if indices.shape != (scores.shape[0], topk) or indices.device != scores.device:
++                raise RuntimeError(
++                    "Routing replay frame does not match this microbatch: "
++                    f"recorded={tuple(indices.shape)}/{indices.device}, "
++                    f"current={(scores.shape[0], topk)}/{scores.device}. "
++                    "Begin a new frame for every student microbatch."
++                )
++            self.replay_calls += 1
++            if self.check_recompute:
++                _, natural_indices = natural_topk(scores, topk)
++                changed = (natural_indices != indices).any(dim=-1).sum().detach()
++                self.recompute_changed_tokens = (
++                    changed if self.recompute_changed_tokens is None else self.recompute_changed_tokens + changed
++                )
++            return scores.gather(1, indices), indices
++
++        values, natural_indices = natural_topk(scores, topk)
++        self.forward_calls += 1
++        if self.forced_indices is None:
++            self.recorded_indices = natural_indices.detach()
++            return values, natural_indices
++
++        forced = self.forced_indices
++        if forced.shape != natural_indices.shape or forced.dtype != torch.long:
++            raise ValueError(
++                "Rollout expert IDs must be int64 and match the local token/top-k layout: "
++                f"got {tuple(forced.shape)}/{forced.dtype}, expected {tuple(natural_indices.shape)}."
++            )
++        if forced.device != scores.device:
++            forced = forced.to(scores.device)
++        valid = forced[:, 0] >= 0
++        # Full payload validation happens on CPU before installing router frames.
++        # Do not introduce a host synchronization at every GPU router/layer.
++        indices = torch.where(valid[:, None], forced, natural_indices).detach()
++        self.recorded_indices = indices
++        self.forced_indices = None
++        self.forced_tokens = valid.sum().detach()
++        same_set = (
++            natural_indices.sort(dim=-1).values == indices.sort(dim=-1).values
++        ).all(dim=-1)
++        self.changed_tokens = ((~same_set) & valid).sum().detach()
++        return scores.gather(1, indices), indices
++
++
++def validate_expert_indices(
++    indices: torch.Tensor, num_experts: int, topk: int
++) -> torch.Tensor:
++    """Validate external IDs once on CPU, before installing any GPU frames.
++
++    Shape is [tokens, layers, topk] (or a single [tokens, topk] test frame).
++    The only missing-route representation is an entire row of -1 values.
++    """
++    if indices.device.type != "cpu":
++        raise ValueError("Validate routing metadata on CPU before moving it to the student.")
++    if indices.ndim not in (2, 3) or indices.shape[-1] != topk:
++        raise ValueError(f"Invalid expert-ID layout: {tuple(indices.shape)}, topk={topk}.")
++    if indices.dtype not in (torch.int16, torch.int32, torch.int64, torch.uint8, torch.uint16):
++        raise ValueError(f"Expert IDs must have an integer dtype, got {indices.dtype}.")
++    if not 0 < topk <= num_experts:
++        raise ValueError(f"Invalid topk/num_experts: {topk}/{num_experts}.")
++    values = indices.long()
++    missing = values == -1
++    if not torch.equal(missing.any(dim=-1), missing.all(dim=-1)):
++        raise ValueError("Missing routes must use -1 for the entire top-k row.")
++    valid = ~missing.all(dim=-1)
++    rows = values[valid]
++    if rows.numel():
++        if rows.min() < 0 or rows.max() >= num_experts:
++            raise ValueError(f"Expert ID outside [0, {num_experts}).")
++        sorted_rows = rows.sort(dim=-1).values
++        if (sorted_rows[:, 1:] == sorted_rows[:, :-1]).any():
++            raise ValueError("A token cannot route to the same expert more than once.")
++    return values

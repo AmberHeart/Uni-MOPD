@@ -107,6 +107,8 @@ class RolloutArguments(DeployArguments):
     max_turns: Optional[int] = None
     vllm_enable_lora: bool = False
     vllm_max_lora_rank: int = 16
+    # R3 uses actual expert IDs; disabled servers keep their existing protocol.
+    vllm_return_routed_experts: bool = False
     # GYM env
     gym_env: Optional[str] = None
     context_manager: Optional[str] = None
@@ -136,6 +138,8 @@ class RolloutArguments(DeployArguments):
             self.use_gym_env = self.gym_env is not None
 
     def _check_args(self):
+        if self.vllm_return_routed_experts and (self.multi_turn_scheduler or self.vllm_enable_lora):
+            raise ValueError('R3 route export currently requires single-turn, full-weight rollout.')
         if self.vllm_pipeline_parallel_size > 1:
             raise ValueError('RolloutArguments does not support pipeline parallelism, '
                              'please set vllm_pipeline_parallel_size to 1.')

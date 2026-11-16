@@ -1,12 +1,14 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 import math
 import multiprocessing as mp
+import time
 from itertools import chain
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Union
 
 import numpy as np
 import torch.distributed as dist
 from datasets import Dataset as HfDataset
+from PIL import UnidentifiedImageError
 from torch.utils.data import Dataset, IterableDataset
 from tqdm import tqdm
 
@@ -69,9 +71,15 @@ class LazyLLMDataset(Dataset):
                  n_try_fetch: int = 10,
                  strict: bool = False,
                  random_state: Optional[Union[np.random.RandomState, int]] = None,
-                 traceback_limit: int = 10) -> None:
+                 traceback_limit: int = 10,
+                 encode_retries: int = 0,
+                 retry_backoff: float = 0.5) -> None:
         self.dataset = dataset
         self.encode_func = encode_func
+        if encode_retries < 0 or retry_backoff < 0:
+            raise ValueError('Encoding retry count/backoff must be nonnegative.')
+        self.encode_retries = encode_retries
+        self.retry_backoff = retry_backoff
 
         n_try_fetch = 1 if strict else min(n_try_fetch, len(self.dataset))
         assert n_try_fetch >= 1
@@ -97,20 +105,25 @@ class LazyLLMDataset(Dataset):
             else:
                 i = self._idx_list[self._idx]
                 self._idx = (self._idx + 1) % len(self.dataset)
-            data = self.dataset[i]
-            try:
-                return self.encode_func(data, return_length=True)
-            except Exception:
-                if n_try == self.n_try_fetch - 1 or self.strict:
-                    if self.strict:
-                        logger.warning('To avoid errors, you can pass `strict=False`.')
-                    raise
-                if self.traceback_limit is not None and self._traceback_counter < self.traceback_limit:
-                    import traceback
-                    logger.info(traceback.format_exc())
-                    logger.warning('👆👆👆There are errors in the template.encode, '
-                                   'and another piece of data will be randomly selected.')
-                    self._traceback_counter += 1
+            for retry in range(self.encode_retries + 1):
+                try:
+                    return self.encode_func(self.dataset[i], return_length=True)
+                except Exception as exc:
+                    if (isinstance(exc, OSError) and not isinstance(exc, UnidentifiedImageError)
+                            and retry < self.encode_retries):
+                        time.sleep(self.retry_backoff * 2**retry)
+                        continue
+                    if n_try == self.n_try_fetch - 1 or self.strict:
+                        if self.strict:
+                            logger.warning(f'Strict encoding refused to replace dataset row {i}; '
+                                           'repair the input or filesystem access before resuming.')
+                        raise
+                    if self.traceback_limit is not None and self._traceback_counter < self.traceback_limit:
+                        import traceback
+                        logger.info(traceback.format_exc())
+                        logger.warning('Template encoding failed; selecting another row because strict=False.')
+                        self._traceback_counter += 1
+                    break
 
         raise ValueError('Failed to retrieve the dataset. You can avoid this issue by increasing `max_length` or '
                          'modifying the `truncation_strategy`.')

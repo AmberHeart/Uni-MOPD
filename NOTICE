@@ -1,0 +1,7 @@
+Uni-MOPD
+Copyright 2026 Uni-MOPD contributors
+
+This product includes a modified copy of ms-swift, distributed under the
+Apache License 2.0. The pinned Megatron-LM checkout is not redistributed by
+this repository; patches applied to it remain subject to the Megatron-LM
+license. Qwen3-VL-derived model weights retain the upstream model license.

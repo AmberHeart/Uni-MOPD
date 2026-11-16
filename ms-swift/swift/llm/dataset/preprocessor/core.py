@@ -14,6 +14,7 @@ from datasets import Sequence, Value
 from modelscope.hub.utils.utils import get_cache_dir
 
 from swift.llm import history_to_messages
+from swift.llm.template.image_budget import split_image_entry
 from swift.utils import get_logger, is_dist, is_master, safe_ddp_context
 
 DATASET_TYPE = Union[HfDataset, HfIterableDataset]
@@ -30,6 +31,7 @@ class RowPreprocessor:
                                 'rejected_response',
                                 'label',
                                 'channel',
+                                'domain',
                                 'margin',
                             ]
 
@@ -82,14 +84,18 @@ class RowPreprocessor:
             if images is None:
                 continue
 
-            if isinstance(images, str) or (isinstance(images, list) and images and isinstance(images[0], str)):
-                if isinstance(images, str):
-                    images = [images]
-                for i, image in enumerate(images):
-                    images[i] = {'bytes': None, 'path': image}
-                row[key] = images
-            elif isinstance(images, dict):
-                row[key] = [images]
+            if isinstance(images, (str, dict)):
+                images = [images]
+            normalized = []
+            for image in images:
+                if isinstance(image, (str, dict)):
+                    source, budget = split_image_entry(image)
+                    if isinstance(source, bytes):
+                        image = {'bytes': source, 'path': None, **budget}
+                    else:
+                        image = {'bytes': None, 'path': source, **budget}
+                normalized.append(image)
+            row[key] = normalized
 
         for key in ['videos', 'audios']:
             mm_data = row.get(key)
@@ -264,7 +270,10 @@ class RowPreprocessor:
                 features['rejected_messages'] = messages_feature_with_loss
                 features['positive_messages'] = [messages_feature]
                 features['negative_messages'] = [messages_feature]
-                features['images'] = [{'bytes': Value(dtype='binary'), 'path': Value(dtype='string')}]
+                features['images'] = [{
+                    'bytes': Value(dtype='binary'), 'path': Value(dtype='string'),
+                    'min_pixels': Value(dtype='int64'), 'max_pixels': Value(dtype='int64'),
+                }]
                 features['objects'] = {
                     'ref': Sequence(feature=Value(dtype='string'), length=-1),
                     'bbox': Sequence(feature=Sequence(feature=Value(dtype='float64'), length=-1), length=-1),

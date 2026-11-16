@@ -10,6 +10,14 @@ Word = Union[str, List[int]]
 Context = Word
 
 
+class MediaTokenIds(list):
+    """Tokenized media tag with provenance, kept until final context encoding."""
+
+    def __init__(self, tokens, media_type: int):
+        super().__init__(tokens)
+        self.media_type = media_type
+
+
 class ContextType:
     RESPONSE = 'response'
     SUFFIX = 'suffix'

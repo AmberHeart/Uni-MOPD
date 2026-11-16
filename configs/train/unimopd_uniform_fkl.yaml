@@ -1,0 +1,4 @@
+# Matched FKL control. All unspecified values are identical to the RKL recipe.
+defaults: unimopd_uniform_rkl.yaml
+gkd_loss_type: jsd
+beta: 0

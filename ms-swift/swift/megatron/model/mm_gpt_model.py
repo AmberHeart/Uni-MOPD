@@ -90,6 +90,8 @@ class MultimodalGPTModel(MegatronModule):
         labels: torch.Tensor = None,
         inference_params: InferenceParams = None,
         packed_seq_params: PackedSeqParams = None,
+        valid_token_indices: Optional[torch.Tensor] = None,
+        mopd_return_hidden_states: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         if decoder_input is not None:
@@ -103,7 +105,7 @@ class MultimodalGPTModel(MegatronModule):
             # decoder will get hidden_states from encoder.input_tensor
             decoder_input = None
             kwargs = {}
-        return self.language_model(
+        output = self.language_model(
             input_ids=input_ids,
             position_ids=position_ids,
             attention_mask=attention_mask,
@@ -111,8 +113,12 @@ class MultimodalGPTModel(MegatronModule):
             labels=labels,
             inference_params=inference_params,
             packed_seq_params=packed_seq_params,
+            # Media processing consumes/clears kwargs; keep head control separate.
+            valid_token_indices=valid_token_indices,
+            mopd_return_hidden_states=mopd_return_hidden_states,
             **kwargs,
         )
+        return output
 
     def set_input_tensor(self, input_tensor: torch.Tensor) -> None:
         return self.language_model.set_input_tensor(input_tensor)

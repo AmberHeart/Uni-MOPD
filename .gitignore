@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+/build/
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Training and merge outputs (repo root only; ms-swift keeps its own .gitignore)
+/output/
+/outputs/
+/runs/
+/checkpoints/
+swanlog/
+wandb/
+
+# Weights and local data never live in this repo
+*.safetensors
+/data/
+
+# Upstream checkout created by setup.sh
+/Megatron-LM/

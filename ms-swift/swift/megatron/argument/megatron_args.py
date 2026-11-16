@@ -1,4 +1,5 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
+import math
 import os
 import sys
 from dataclasses import asdict, dataclass, field, fields
@@ -42,10 +43,135 @@ class RLHFMegatronArgumentsMixin:
     teacher_model: Optional[str] = field(default=None)
     teacher_model_type: Optional[str] = field(default=None)
     teacher_model_revision: Optional[str] = field(default=None)
+    # Optional second teacher for probability-space ensemble distillation. When set, both
+    # teachers are fused into a single target distribution before the reverse-KL loss
+    # (one KL, not two). When None, the pipeline is byte-identical to single-teacher GKD.
+    teacher_model_2: Optional[str] = field(default=None)
+    teacher_model_2_type: Optional[str] = field(default=None)
+    teacher_model_2_revision: Optional[str] = field(default=None)
+    # Fusion mode for the two-teacher ensemble:
+    #   'prob_avg'  — true probability mixture, log-space: logsumexp_i(log w_i + log_softmax(z_i)).
+    #   'logit_avg' — log-linear pool: log_softmax(sum_i w_i * z_i). A DIFFERENT distribution
+    #                 from prob_avg (weighted geometric mean of probs), exposed as experimental.
+    teacher_fusion: Literal['prob_avg', 'logit_avg'] = 'prob_avg'
+    # Per-teacher mixture weights, one per configured teacher. None defaults to equal weights.
+    # Normalized once at validation; every weight must be > 0.
+    teacher_fusion_weights: Optional[List[float]] = None
+    # MOPD multi-teacher distillation by data-domain routing. When `teacher_models`
+    # is set it takes precedence over the
+    # teacher_model_2 fusion path: each training sample carries a `domain` field, and
+    # `domain_teacher_mapping` routes it to one teacher (one teacher per microbatch). KL
+    # direction stays the standard `beta` (no per-route beta). teacher_models is an ordered
+    # list of teacher paths; domain_teacher_mapping is a JSON dict {domain: teacher_index}.
+    teacher_models: Optional[List[str]] = field(default=None)
+    teacher_models_type: Optional[List[str]] = field(default=None)
+    teacher_models_revision: Optional[List[str]] = field(default=None)
+    domain_teacher_mapping: Optional[str] = None  # JSON: {"gui": 0, "spatial": 1}
     lmbda: float = 0.5  # On-policy probability: with prob lmbda, use student-generated responses
     seq_kd: bool = False  # Sequential KD: use teacher-generated responses when not on-policy
     offload_teacher_model: bool = False  # Offload teacher model to CPU to save GPU memory
+    lazy_teacher_logits: bool = True  # GKD: True = compute teacher logits per microbatch in forward_step (save memory); False = pre-compute all in _replace_data_iterator
+    overlap_rollout_training: bool = False  # GKD: True = rollout one microbatch then train it (interleave); False = rollout full batch then train all microbatches
+    # GKD overlap: GLOBAL samples-per-mini-batch chunk used to interleave rollout with
+    # training. Counted across the full global batch (all DP ranks), NOT per-rank. Each DP
+    # rank rolls out its share = mini_batch_size // dp_size samples per vLLM request
+    # (domains may mix within a chunk; vLLM is domain-agnostic). With MICRO_BATCH_SIZE=1
+    # each rolled-out sample becomes its own single-domain microbatch (MBS=1 makes the
+    # per-microbatch teacher grouping trivial); before chunking, the trainer stably sorts
+    # each rank's samples by teacher_idx to minimize teacher body offload/load switches.
+    # Must divide global_batch_size, be a positive multiple of micro_batch_size, and be a
+    # multiple of dp_size so each rank owns whole per-rank chunks.
+    overlap_rollout_mini_batch_size: int = 128
     sft_alpha: float = 0.0  # Weight for SFT loss in GKD (0 = pure JSD, >0 = JSD + sft_alpha * SFT)
+    use_opsd: bool = False  # GKD: True = prepend reference solution to teacher prompt (OPSD) for better guidance; use with lazy_teacher_logits
+    use_sft_loss: bool = False
+    # GKD: floor the teacher distribution with uniform mass: T' = (1-α)T + α/V.
+    # Bounds log(1/T) and tames reverse-KL gradnorm when teacher is sharply peaked.
+    # 0 disables smoothing.
+    teacher_label_smoothing: float = 0.0
+
+    # Keep a teacher body resident across consecutive
+    # same-teacher microbatches in MOPD domain-routing mode. Only meaningful when combined
+    # with `offload_teacher_model=True` and `teacher_models` (routing), because
+    # `_group_batch_by_teacher` already sorts microbatches by teacher — so consecutive
+    # microbatches usually share the same teacher, and per-microbatch load+offload is redundant.
+    # When on: offload the previous resident teacher and load the next ONLY when `teacher_idx`
+    # actually changes. Cuts body loads from `num_microbatches` down to
+    # `num_distinct_teachers_this_step`. When off: byte-identical to the legacy path
+    # (`load_teacher_model_context` per microbatch).
+    #
+    # Default is True: for eligible runs (routed MOPD + offload_teacher_model) this is a
+    # pure scheduling win with byte-identical teacher forward math. For ineligible runs
+    # (single-teacher, weighted_multi_kl, or offload off) `_validate_teacher_body_reuse`
+    # AUTO-DOWNGRADES this to False with an info log, and the trainer's runtime guard
+    # `_use_body_reuse = teacher_body_reuse and offload_teacher_model and multi_teacher_mode`
+    # is itself a no-op there — so flipping the default is safe for every existing config.
+    teacher_body_reuse: bool = True
+
+    # Skip the per-microbatch DP metric all-reduce inside GKD loss_func. When True,
+    # metrics are rank-local. Optimization is unchanged because Megatron reduces
+    # gradients separately. This avoids interleaving variable-shape metric
+    # collectives with MoE expert/tensor-parallel collectives.
+    skip_metric_dp_allreduce: bool = True
+
+    # Diagnostic-metrics collection interval (0 = every step, N = every N steps + step 1).
+    # Read by the GKD trainer; declared here so it is accepted as a CLI arg.
+    # Default 1 collects the no-grad full-vocabulary diagnostics every step.
+    diagnostics_interval: int = 1
+
+    # MOPD encode-resample transient-retry knobs (truncation_strategy='delete' path only).
+    # When a sample fails to encode, the trainer first RETRIES THE ORIGINAL sample a few
+    # times before discarding it for a route-local replacement. This preserves
+    # the intended domain mixture across transient filesystem failures.
+    #   mopd_resample_retries: retries of the ORIGINAL sample before replacement (0 = legacy
+    #     behaviour: never retry, replace immediately).
+    #   mopd_resample_backoff_base_s: first backoff delay; each retry doubles it (exp backoff),
+    #     so 3 retries -> 0.5 / 1.0 / 2.0s, worst case 3.5s per failed sample.
+    #   mopd_resample_retry_budget_s: hard per-call limit on total sleep across ALL failed
+    #     samples in one resample call, so a pathological burst (hundreds of failures) cannot
+    #     add hours to a long run — once exceeded, remaining failures skip straight to replacement.
+    # Only transient I/O (OSError/IOError, e.g. FileNotFoundError) is retried; decode/parse
+    # failures (UnidentifiedImageError, ValueError, KeyError) are never retried — see the
+    # classification in gkd_trainer.resample_encode_failed_inputs. Env overrides:
+    # MOPD_RESAMPLE_RETRIES / MOPD_RESAMPLE_BACKOFF_BASE_S / MOPD_RESAMPLE_RETRY_BUDGET_S.
+    mopd_resample_retries: int = 0
+    mopd_resample_backoff_base_s: float = 0.5
+    mopd_resample_retry_budget_s: float = 60.0
+
+    # MOPD loss normalization mode. Default None = fully legacy: behavior is derived from
+    # ``calculate_per_token_loss`` and NOTHING changes anywhere. The four modes:
+    #   'sequence'     -- pure alias: SETS calculate_per_token_loss=False (the legacy
+    #                     per-microbatch / per-sequence mean path, byte-identical).
+    #   'global_token' -- pure alias: SETS calculate_per_token_loss=True (the existing
+    #                     token-weighted global path, byte-identical). A long sequence is
+    #                     weighted proportionally to its token count.
+    #   'domain_sequence' / 'domain_token' -- PER-DOMAIN normalization for MOPD multi-teacher
+    #                     routing. The global-step loss is a weighted sum over domain groups
+    #                     (group key = the sample's `domain` name; domains sharing a teacher
+    #                     stay separate groups), so each domain's contribution is decoupled
+    #                     from its token / sample share of the batch:
+    #                       domain_sequence: L = sum_d q_d * (1/B_d) * sum_{i in d}(loss_sum_i / T_i)
+    #                                          -- every SAMPLE in a domain weighs equally.
+    #                       domain_token:    L = sum_d q_d * (sum_{i in d} loss_sum_i) / N_d
+    #                                          -- every TOKEN in a domain weighs equally.
+    #                     where B_d = #samples, N_d = #valid completion tokens, T_i = sample i's
+    #                     valid tokens, q_d = normalized domain weight (uniform by default),
+    #                     all measured over the FULL global step (across DP). Require MOPD
+    #                     routing (teacher_models + domain_teacher_mapping), calculate_per_token_loss
+    #                     False (they use the 2-tuple loss protocol), sft_alpha==0,
+    #                     context_parallel_size==1, micro_batch_size==1, and no
+    #                     overlap_rollout_training. See gkd_trainer._compute_domain_loss_scales
+    #                     for the verified Megatron scaling chain. Validated in
+    #                     _init_mopd_loss_normalization.
+    mopd_loss_normalization: Optional[Literal['sequence', 'global_token', 'domain_sequence',
+                                              'domain_token']] = None
+    # Optional per-domain loss weights for the two domain modes only: JSON dict
+    # {domain_name: weight}. Keys must be a SUBSET of domain_teacher_mapping; every weight
+    # must be finite and > 0; unspecified domains default to weight 1.0. Each domain is its
+    # own group (keyed by domain name — domains sharing a teacher are NOT merged). Normalized
+    # internally each step over the domains actually present. Setting this without a domain
+    # mode is an error. Default None = uniform.
+    mopd_domain_loss_weights: Optional[str] = None
 
     # grpo/gkd
     temperature: float = 0.9  # Temperature for sampling and loss computation
@@ -184,12 +310,348 @@ class RLHFMegatronArgumentsMixin:
             self.loss_type = default_loss_type.get(self.rlhf_type)
         if self.rlhf_type == 'kto':
             self._init_kto()
+        if self.rlhf_type == 'gkd':
+            self._init_gkd_ensemble()
+            self._init_mopd_loss_normalization()
+            self._validate_teacher_body_reuse()
         if self.rlhf_type == 'grpo':
             assert self.vllm_mode is not None, 'vllm_mode is required for Megatron GRPO'
             self._init_grpo()
             if self.vllm_limit_mm_per_prompt is not None:
                 self.vllm_limit_mm_per_prompt = json_parse_to_dict(self.vllm_limit_mm_per_prompt)
             self.vllm_engine_kwargs = json_parse_to_dict(self.vllm_engine_kwargs)
+
+    def _init_gkd_ensemble(self):
+        """Validate and normalize the multi-teacher configuration.
+
+        Two independent multi-teacher modes:
+          - MOPD domain routing (`teacher_models` set): per-sample `domain` routes to one
+            teacher via `domain_teacher_mapping`; standard `beta` KL. Takes precedence.
+          - Two-teacher probability fusion (`teacher_model_2` set): fuse into one target.
+        Single-teacher GKD (neither set) is left untouched / byte-identical.
+        """
+        # MOPD domain-routing mode.
+        if self.teacher_models is not None:
+            if len(self.teacher_models) == 0:
+                raise ValueError('teacher_models is set but empty.')
+            num_teachers = len(self.teacher_models)
+            if self.domain_teacher_mapping is None:
+                raise ValueError('domain_teacher_mapping is required when teacher_models is set.')
+            mapping = json_parse_to_dict(self.domain_teacher_mapping) \
+                if isinstance(self.domain_teacher_mapping, str) else self.domain_teacher_mapping
+            if not isinstance(mapping, dict) or len(mapping) == 0:
+                raise ValueError(
+                    f'domain_teacher_mapping must be a non-empty JSON dict {{domain: teacher_index}}, '
+                    f'got {self.domain_teacher_mapping!r}.')
+            for domain, idx in mapping.items():
+                if not isinstance(idx, int) or idx < 0 or idx >= num_teachers:
+                    raise ValueError(
+                        f'domain_teacher_mapping["{domain}"]={idx} out of range [0, {num_teachers}).')
+            # Store the parsed mapping back so the trainer reads a dict (not a JSON string).
+            self.domain_teacher_mapping = mapping
+            if self.teacher_model_2 is not None:
+                raise ValueError('teacher_models (domain routing) and teacher_model_2 (fusion) are '
+                                 'mutually exclusive; set only one.')
+            if not self.lazy_teacher_logits:
+                raise ValueError('lazy_teacher_logits=False is not supported with teacher_models; '
+                                 'set lazy_teacher_logits=True.')
+            # MOPD domain routing requires MBS=1 UNCONDITIONALLY (not only under overlap,
+            # where a second copy of this check lives below): microbatches must be
+            # single-sample so each is single-domain — the route stamps, the per-domain
+            # metric accumulation and domain loss scales all read the microbatch's single raw
+            # sample (raw_batch[0]). With MBS>1 a mixed-domain microbatch would silently
+            # mis-attribute metrics/scales to the first sample's domain. Fail fast.
+            _mbs = int(getattr(self, 'micro_batch_size', 1) or 1)
+            if _mbs != 1:
+                raise ValueError(
+                    f'micro_batch_size must be 1 when teacher_models is set (MOPD domain '
+                    f'routing tiles one single-domain microbatch per sample), got {_mbs}.')
+            # MOPD + overlap: overlap_rollout_mini_batch_size is a GLOBAL sample count.
+            # The producer walks each rank's share (mini_bs // dp_size samples per chunk)
+            # after stably sorting by teacher_idx; with MBS=1 each rolled-out sample is its
+            # own single-domain microbatch (teacher_idx tagged per microbatch). Requires
+            # mini_bs to divide global_batch_size cleanly and be a positive multiple of
+            # micro_batch_size. Note: dp_size may not be known here yet (constructed later),
+            # so the dp_size-divisibility check is done defensively in the trainer producer.
+            if getattr(self, 'overlap_rollout_training', False):
+                mini_bs = int(getattr(self, 'overlap_rollout_mini_batch_size', 0) or 0)
+                mbs = int(getattr(self, 'micro_batch_size', 1) or 1)
+                gbs = int(getattr(self, 'global_batch_size', 0) or 0)
+                if mini_bs <= 0:
+                    raise ValueError(
+                        f'overlap_rollout_mini_batch_size must be > 0 when overlap_rollout_training '
+                        f'is enabled with teacher_models (MOPD), got {mini_bs}.')
+                # The MOPD overlap producer emits one single-domain microbatch per rolled-out
+                # sample (teacher_idx tagged per microbatch), which is only correct when each
+                # microbatch is exactly one sample. With MBS>1 the producer would queue
+                # num_microbatches*MBS single-sample microbatches into a schedule expecting
+                # MBS-sized batches -> late abort or corrupted training step. Fail fast.
+                if mbs != 1:
+                    raise ValueError(
+                        f'micro_batch_size must be 1 when overlap_rollout_training is enabled with '
+                        f'teacher_models (MOPD domain routing); the overlap producer tiles one '
+                        f'single-domain microbatch per sample. Got micro_batch_size={mbs}.')
+                if mini_bs % mbs != 0:
+                    raise ValueError(
+                        f'overlap_rollout_mini_batch_size ({mini_bs}) must be a positive multiple of '
+                        f'micro_batch_size ({mbs}) so each mini-batch splits into whole microbatches.')
+                if gbs > 0 and gbs % mini_bs != 0:
+                    raise ValueError(
+                        f'overlap_rollout_mini_batch_size ({mini_bs}) must divide global_batch_size '
+                        f'({gbs}) so the global batch tiles cleanly into mini-batches.')
+            # Reject pipeline parallelism: teacher forward uses PP send/recv collectives, and
+            # per-microbatch teacher routing can select different teacher stages across a PP
+            # group -> mismatched activations / hang. This recipe uses PP=1; fail fast.
+            pp_size = int(getattr(self, 'pipeline_model_parallel_size', 1) or 1)
+            if pp_size > 1:
+                raise ValueError(
+                    f'pipeline_model_parallel_size={pp_size} is not supported with teacher_models '
+                    '(MOPD domain routing): per-microbatch teacher routing can mismatch teacher '
+                    'stages across a pipeline group. Use pipeline_model_parallel_size=1.')
+            # Reject OPSD: MOPD groups/reorders samples by domain, so the positional OPSD
+            # ref-answer mapping is invalid. It is silently skipped in the trainer for MOPD;
+            # fail fast here instead of ignoring a requested option.
+            if getattr(self, 'use_opsd', False):
+                raise ValueError(
+                    'use_opsd is not supported with teacher_models (MOPD domain routing): OPSD '
+                    'ref-answer mapping is positional and MOPD reorders samples by domain. '
+                    'Disable use_opsd.')
+            # If teacher type/revision lists are given, they must match teacher_models length.
+            for name in ('teacher_models_type', 'teacher_models_revision'):
+                val = getattr(self, name, None)
+                if val is not None and len(val) != num_teachers:
+                    raise ValueError(
+                        f'{name} has length {len(val)} but must match teacher_models '
+                        f'({num_teachers}) when provided.')
+            return
+
+        # Ordered list of configured teacher paths. Index 0 is the primary teacher.
+        teachers = [self.teacher_model]
+        if self.teacher_model_2 is not None:
+            teachers.append(self.teacher_model_2)
+        num_teachers = len([t for t in teachers if t is not None])
+
+        if self.teacher_fusion not in ('prob_avg', 'logit_avg'):
+            raise ValueError(
+                f"teacher_fusion must be one of 'prob_avg' or 'logit_avg', got '{self.teacher_fusion}'.")
+
+        single_teacher = self.teacher_model_2 is None
+        if single_teacher:
+            # Nothing else to validate; do NOT mutate any state that would change the
+            # byte-identical single-teacher path. Leave teacher_fusion_weights as-is.
+            return
+
+        # --- Two-teacher constraints ---
+        # Force lazy teacher logits: non-lazy would precompute/store two full teacher
+        # tensors per encoded batch, which is unacceptable memory.
+        if not self.lazy_teacher_logits:
+            raise ValueError(
+                'lazy_teacher_logits=False is not supported with two teachers '
+                '(teacher_model_2 set). Non-lazy mode would precompute and store two full '
+                'teacher logit tensors per batch. Set lazy_teacher_logits=True.')
+
+        # Reject context parallelism: the fused-teacher helper builds the completion mask
+        # from full-sequence labels, while the per-teacher forward CP-slices its logits to
+        # the CP-local sequence. Mixing a full-sequence mask with CP-local teacher logits
+        # would misalign (or shape-mismatch) the fused target. CP-sliced fusion is out of
+        # scope for this version; fail fast rather than fuse over mismatched sequences.
+        cp_size = int(getattr(self, 'context_parallel_size', 1) or 1)
+        if cp_size > 1:
+            raise ValueError(
+                f'context_parallel_size={cp_size} is not supported with two teachers '
+                '(teacher_model_2 set): the fused-teacher mask is built from full-sequence '
+                'labels while teacher logits are CP-sliced, which would misalign the fused '
+                'target. Use context_parallel_size=1 for two-teacher ensemble distillation.')
+
+        # Reject pipeline parallelism: the fused helper forwards teachers sequentially and
+        # returns None on a non-last PP rank. Under PP>1 that early-return makes non-last
+        # ranks skip the second teacher's forward while the last rank expects all teachers'
+        # activations -> pipeline hang / mismatched activations. A PP-correct multi-teacher
+        # forward is out of scope this version (this recipe uses PP=1); fail fast.
+        pp_size = int(getattr(self, 'pipeline_model_parallel_size', 1) or 1)
+        if pp_size > 1:
+            raise ValueError(
+                f'pipeline_model_parallel_size={pp_size} is not supported with two teachers '
+                '(teacher_model_2 set): the sequential fused-teacher forward would skip the '
+                'second teacher on non-last PP ranks and deadlock the pipeline. Use '
+                'pipeline_model_parallel_size=1 for two-teacher ensemble distillation.')
+
+        # Reject OPSD: the OPSD completion-row mapping (opsd_completion_start) indexes the
+        # UNROLLED labels, but the two-teacher fused mask uses the loss-aligned (rolled for
+        # causal_lm) labels. Reconciling those two alignments for OPSD is not safe in this
+        # version, so OPSD ensemble distillation is out of scope; fail fast.
+        if getattr(self, 'use_opsd', False):
+            raise ValueError(
+                'use_opsd is not supported with two teachers (teacher_model_2 set): the OPSD '
+                'completion mapping indexes unrolled labels while the fused mask uses the '
+                'rolled student-loss labels, which would misalign the fused target. Disable '
+                'use_opsd for two-teacher ensemble distillation.')
+
+        # Normalize fusion weights ONCE here so every rank reads the identical tuple.
+        if self.teacher_fusion_weights is None:
+            weights = [1.0 / num_teachers] * num_teachers
+        else:
+            weights = list(self.teacher_fusion_weights)
+            if len(weights) != num_teachers:
+                raise ValueError(
+                    f'teacher_fusion_weights must have one weight per teacher '
+                    f'({num_teachers}), got {len(weights)}.')
+            # Reject non-finite weights BEFORE the > 0 check: NaN slips past `w <= 0`
+            # (nan comparisons are False) and inf poisons normalization, and either turns
+            # math.log(w) / the fused target into NaNs downstream.
+            if any(not math.isfinite(w) for w in weights):
+                raise ValueError(
+                    f'teacher_fusion_weights must all be finite, got {weights}.')
+            if any(w <= 0 for w in weights):
+                raise ValueError(
+                    f'teacher_fusion_weights must all be > 0, got {weights}. '
+                    'A zero/negative weight is rejected (skipping a teacher is out of scope).')
+            total = sum(weights)
+            weights = [w / total for w in weights]
+        self.teacher_fusion_weights = weights
+
+
+    def _init_mopd_loss_normalization(self):
+        """Validate the MOPD loss-normalization mode and optional per-domain weights.
+
+        Runs AFTER ``_init_gkd_ensemble`` so ``domain_teacher_mapping`` is already parsed
+        into a dict on the MOPD routing path. Contract:
+
+          - None -> fully legacy; behavior derived from ``calculate_per_token_loss``.
+            Nothing is mutated (and ``mopd_domain_loss_weights`` must be unset).
+          - 'sequence' / 'global_token' -> pure aliases that SET
+            ``calculate_per_token_loss`` False / True. The RLHF default is False, so an
+            explicitly-set True is the only cleanly-detectable value: we fail iff the user
+            asked for 'sequence' (target False) while calculate_per_token_loss is True.
+            For 'global_token' (target True) a currently-False value is indistinguishable
+            from the default, so we simply set it True (documented limitation).
+          - 'domain_sequence' / 'domain_token' -> per-domain normalization; require MOPD
+            multi-teacher routing, calculate_per_token_loss False, sft_alpha==0,
+            context_parallel_size==1, micro_batch_size==1, and no overlap_rollout_training.
+          - ``mopd_domain_loss_weights`` is only meaningful for a domain mode; keys must be
+            a subset of ``domain_teacher_mapping`` and every weight finite and > 0.
+        """
+        mode = self.mopd_loss_normalization
+        weights_raw = self.mopd_domain_loss_weights
+
+        if mode is None:
+            if weights_raw is not None:
+                raise ValueError(
+                    'mopd_domain_loss_weights requires mopd_loss_normalization to be a '
+                    "domain mode ('domain_sequence' or 'domain_token').")
+            return
+
+        # RLHF default for calculate_per_token_loss is False (rlhf_args.py); a True value
+        # can therefore only have been passed explicitly. That is the sole conflict this
+        # dataclass flow can detect without a provenance sentinel.
+        cptl = bool(self.calculate_per_token_loss)
+
+        if mode in ('sequence', 'global_token'):
+            if weights_raw is not None:
+                raise ValueError(
+                    'mopd_domain_loss_weights is only meaningful for the domain '
+                    f"normalization modes, not '{mode}'.")
+            target = (mode == 'global_token')
+            if cptl and not target:
+                raise ValueError(
+                    "mopd_loss_normalization='sequence' conflicts with "
+                    'calculate_per_token_loss=True. Drop the redundant '
+                    'calculate_per_token_loss flag; the mode alias sets it.')
+            self.calculate_per_token_loss = target
+            return
+
+        # --- domain modes ---
+        if self.teacher_models is None or not self.domain_teacher_mapping:
+            raise ValueError(
+                f"mopd_loss_normalization='{mode}' requires MOPD multi-teacher routing "
+                '(set teacher_models and domain_teacher_mapping).')
+        if cptl:
+            raise ValueError(
+                f"mopd_loss_normalization='{mode}' uses the per-sequence (2-tuple) loss "
+                'protocol and is incompatible with calculate_per_token_loss=True. Drop the '
+                'calculate_per_token_loss flag.')
+        # Pin False so the trainer's 2-tuple loss branch is taken.
+        self.calculate_per_token_loss = False
+        # Reject ANY non-zero sft_alpha, including negative and NaN. `not (x == 0)` is True
+        # for NaN (NaN == 0 is False) and for negatives, which a plain `> 0` check would let
+        # through to the trainer's `sft_alpha > 0` gate and silently treat as disabled.
+        if not (self.sft_alpha == 0):
+            raise ValueError(
+                f"mopd_loss_normalization='{mode}' does not define the SFT auxiliary term "
+                f'(sft_alpha={self.sft_alpha}); set sft_alpha=0. Pure MOPD is lambda=1 '
+                'pure on-policy, so this costs nothing.')
+        cp_size = int(getattr(self, 'context_parallel_size', 1) or 1)
+        if cp_size > 1:
+            raise ValueError(
+                f"mopd_loss_normalization='{mode}' requires context_parallel_size==1 "
+                f'(got {cp_size}); the per-domain loss/token sums are CP-local by construction.')
+        mbs = int(getattr(self, 'micro_batch_size', 1) or 1)
+        if mbs != 1:
+            raise ValueError(
+                f"mopd_loss_normalization='{mode}' requires micro_batch_size==1 (got {mbs}); "
+                'each microbatch must be one single-domain sample so the per-domain sample '
+                'and token counts are well defined.')
+        if bool(getattr(self, 'overlap_rollout_training', False)):
+            raise ValueError(
+                f"mopd_loss_normalization='{mode}' is not supported with "
+                'overlap_rollout_training: the per-domain counts need one fixed-shape DP '
+                'all-reduce over the whole step before any forward, which the interleaved '
+                'overlap producer cannot provide.')
+
+        if weights_raw is not None:
+            weights = json_parse_to_dict(weights_raw) if isinstance(weights_raw, str) else weights_raw
+            if not isinstance(weights, dict) or len(weights) == 0:
+                raise ValueError(
+                    'mopd_domain_loss_weights must be a non-empty JSON dict {domain: weight}, '
+                    f'got {weights_raw!r}.')
+            mapping_keys = set(self.domain_teacher_mapping.keys())
+            for domain, w in weights.items():
+                if domain not in mapping_keys:
+                    raise ValueError(
+                        f'mopd_domain_loss_weights domain "{domain}" is not in '
+                        f'domain_teacher_mapping (available: {sorted(mapping_keys)}).')
+                if isinstance(w, bool) or not isinstance(w, (int, float)) \
+                        or not math.isfinite(w) or w <= 0:
+                    raise ValueError(
+                        f'mopd_domain_loss_weights["{domain}"]={w!r} must be a finite '
+                        'weight > 0.')
+            # Store back a plain float dict so the trainer reads it directly.
+            self.mopd_domain_loss_weights = {k: float(v) for k, v in weights.items()}
+
+    def _validate_teacher_body_reuse(self):
+        """Validate the teacher body-reuse optimization.
+
+        The optimization keeps a teacher's body resident across consecutive same-teacher
+        microbatches, avoiding redundant load/offload cycles. It is only meaningful when
+        (a) `offload_teacher_model=True` (otherwise bodies are already resident) and
+        (b) MOPD domain routing (`teacher_models` set) is active — that is the routed
+        path where `_group_batch_by_teacher` sorts microbatches by teacher, so residency
+        is what actually shortens the schedule.
+
+        Ineligible configurations are downgraded to ``False`` with one
+        explanatory log entry so the effective configuration remains accurate.
+        """
+        if not self.teacher_body_reuse:
+            return
+        eligible = self.offload_teacher_model and (self.teacher_models is not None)
+        if eligible:
+            return
+        # Explain WHY it was downgraded so a reader inspecting the run log can tell
+        # whether to flip offload on or switch to routed MOPD if they wanted the speedup.
+        if not self.offload_teacher_model and self.teacher_models is None:
+            reason = ('offload_teacher_model=False and no teacher_models (single-teacher or '
+                      'weighted_multi_kl run): teachers are already resident and there is no '
+                      'routing sort to exploit')
+        elif not self.offload_teacher_model:
+            reason = 'offload_teacher_model=False: teachers already resident, no load/offload to elide'
+        else:
+            reason = ('teacher_models is None (single-teacher or weighted_multi_kl run): the '
+                      'residency schedule only pays off on the routed path where '
+                      '_group_batch_by_teacher sorts microbatches by teacher')
+        logger.info(
+            f'teacher_body_reuse auto-disabled: {reason}. This run uses '
+            'per-microbatch load_teacher_model_context.')
+        self.teacher_body_reuse = False
 
     def _init_grpo(self):
 
@@ -341,6 +803,7 @@ class ExtraMegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
     dataloader_persistent_workers: bool = True
     dataloader_prefetch_factor: int = 2
     group_by_length: bool = False
+    mopd_domain_balanced_sampler: bool = False
 
     architectures: Optional[str] = None
     llm_architectures: Optional[str] = None
@@ -351,6 +814,7 @@ class ExtraMegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
     num_labels: Optional[int] = None
     problem_type: Literal['regression', 'single_label_classification', 'multi_label_classification'] = None
     save_strategy: Literal['steps', 'epoch'] = 'steps'
+    mopd_prune_old_optimizer_states: bool = False
 
     original_max_position_embeddings: Optional[int] = None
     partial_rotary_factor: Optional[float] = None

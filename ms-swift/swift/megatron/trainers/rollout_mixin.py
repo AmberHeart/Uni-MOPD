@@ -32,49 +32,83 @@ DataType = List[Dict[str, Union[torch.Tensor, Any]]]
 logger = get_logger()
 
 
+def _assert_rollout_token_logprob_alignment(records: DataType) -> None:
+    """Fail loudly when vLLM's returned response_token_ids and rollout_logprobs
+    don't line up 1:1 for the same rollout.
+
+    Runs unconditionally after every rollout postprocess (cheap: pure Python len
+    check on already-materialized lists). The 1:1 correspondence is what makes a
+    returned log-probability attributable to a specific token, so any comparison
+    against recomputed log-probabilities depends on it. Silently truncating to
+    min(len) would instead hide the misalignments that produce it: chat-template
+    drift, tokenizer mismatch, EOS handling, and packing edge cases. Records with
+    both fields empty are allowed (off-policy dataset path); records with only one
+    side populated are fatal.
+    """
+    for i, rec in enumerate(records):
+        ids = rec.get('response_token_ids')
+        logps = rec.get('rollout_logprobs')
+
+        def _flat_len(x):
+            # response_token_ids / rollout_logprobs are stored as either flat list
+            # or nested list-of-turns (one turn per assistant response). This helper
+            # returns the number of *token positions* along the response axis.
+            if x is None or len(x) == 0:
+                return 0
+            head = x[0]
+            if isinstance(head, (list, tuple)):
+                return sum(len(t) for t in x)
+            return len(x)
+
+        n_ids = _flat_len(ids)
+        n_logps = _flat_len(logps)
+        if n_ids == 0 and n_logps == 0:
+            continue
+        if n_ids == 0 or n_logps == 0:
+            raise RuntimeError(
+                f'[rollout-alignment] record #{i}: only one of (response_token_ids, rollout_logprobs) '
+                f'is populated (n_ids={n_ids}, n_logps={n_logps}). This breaks the training-side '
+                f'invariant that vLLM ids are used verbatim in the assistant span; refusing to continue. '
+                f'finish_reason={rec.get("finish_reason")!r}')
+        if n_ids != n_logps:
+            raise RuntimeError(
+                f'[rollout-alignment] record #{i}: response_token_ids length {n_ids} != '
+                f'rollout_logprobs length {n_logps}. finish_reason={rec.get("finish_reason")!r}. '
+                f'This means the vLLM server returned mismatched token vs logprob streams '
+                f'(candidate causes: chat_template drift, thinking-tag stripping, EOS accounting). '
+                f'Refusing to continue — any downstream logprob audit or importance ratio would be '
+                f'silently misaligned.')
+
+
 def create_rollout_group(trainer) -> torch.distributed.ProcessGroup:
     """
-    Get or create the rollout process group (TP×PP×CP).
+    Get or create the rollout process group (TP×PP, or TP×CP×PP when CP>1).
 
-    This is a shared function used by both MegatronRolloutMixin and MegatronGRPOTrainer.
+    Groups ranks that share the same data-parallel index so they can coordinate
+    rollout data distribution and gather operations. EP ranks share the same input
+    data (only expert weights differ), so EP is NOT included in the rollout group.
 
-    The rollout group is used for:
-    1. Data slicing: distributing rollout data across ranks with same data samples
-    2. Gather operations: collecting results from ranks with same data samples
-
-    Note: Groups are created per data parallel index, containing TP×PP×CP ranks each.
-    This follows Megatron's data_iterator logic where same data_parallel_rank processes
-    identical data samples.
-
-    Key insight: ranks with the SAME data parallel index process the SAME data samples
-    and must coordinate for rollout data distribution.
-    Megatron rank order: TP → CP → EP → DP → PP
-
-    Args:
-        trainer: Trainer instance with _rollout_group and _rollout_groups_created attributes
-
-    Returns:
-        The rollout process group for this rank
+    For CP=1: reuses MODEL_PARALLEL_GROUP (tp-pp), regardless of EP setting.
+    For CP>1: builds custom groups via RankGenerator (tp-cp-pp), with ep=1.
     """
     if trainer._rollout_group is not None:
         return trainer._rollout_group
 
     cp_size = mpu.get_context_parallel_world_size()
+
     if cp_size == 1:
-        # No CP, use the standard MODEL_PARALLEL_GROUP
         trainer._rollout_group = mpu.get_model_parallel_group()
         return trainer._rollout_group
 
-    # Use RankGenerator to create rollout groups following Megatron-LM logic
+    # CP>1: create tp-cp-pp groups for each data-parallel replica.
+    # Megatron requires EP=1 when CP>1, so the DP size already covers the
+    # remaining world-size dimension without an additional EP factor.
     global_rank = torch.distributed.get_rank()
 
-    # Get parallel dimensions
     tp_size = mpu.get_tensor_model_parallel_world_size()
     pp_size = mpu.get_pipeline_model_parallel_world_size()
     dp_size = mpu.get_data_parallel_world_size()
 
-    # Create RankGenerator following Megatron-LM pattern
-    # Order: tp-cp-ep-dp-pp (default in Megatron-LM)
     decoder_rank_generator = mpu.RankGenerator(
         tp=tp_size,
         ep=1,
@@ -85,13 +119,9 @@ def create_rollout_group(trainer) -> torch.distributed.ProcessGroup:
         rank_offset=0,
     )
 
-    # Create rollout groups based on data consistency from data_iterator
-    # Same data_parallel_rank processes same data - group ranks with same DP index
     if not trainer._rollout_groups_created:
-        # Use 'tp-cp-ep-pp' to get groups with same DP index (DP is excluded from variation)
-        dp_groups = decoder_rank_generator.get_ranks('tp-cp-ep-pp')
+        dp_groups = decoder_rank_generator.get_ranks('tp-cp-pp')
         for dp_group_ranks in dp_groups:
-            # Sort for consistency
             dp_group_ranks = sorted(dp_group_ranks)
             group = torch.distributed.new_group(ranks=dp_group_ranks, group_desc='ROLLOUT_GROUP')
 
@@ -109,8 +139,16 @@ class MegatronRolloutMixin:
         args = self.args
         # distributed params
         self.world_size = torch.distributed.get_world_size()
+        if getattr(args, 'overlap_rollout_training', False) and self.world_size > 1:
+            raise ValueError('overlap_rollout_training is not supported across multiple train ranks; '
+                             'use OVERLAP=0 to keep rollout and training collectives ordered.')
         self.process_index = torch.distributed.get_rank()
-        self.is_main_process = is_last_rank()
+        # Use node-0's last GPU rank so that is_main_process is stable across
+        # different numbers of training nodes.  is_last_rank() returns
+        # rank == world_size-1 which moves to node 1 in multi-node setups.
+        nproc_per_node = int(os.environ.get('NPROC_PER_NODE', self.world_size))
+        self._main_process_rank = nproc_per_node - 1
+        self.is_main_process = (self.process_index == self._main_process_rank)
         self.device = get_current_device()
 
         # sampling params
@@ -118,17 +156,36 @@ class MegatronRolloutMixin:
         self.max_completion_length = args.max_completion_length
         structured_outputs_regex = getattr(args, 'structured_outputs_regex', None)
 
+        # Pass every sampling field explicitly so model-side generation
+        # defaults cannot silently override the effective training config.
         self.request_config = RequestConfig(
             n=1,
             max_tokens=args.max_completion_length,
             temperature=args.temperature,
-            top_p=getattr(args, 'top_p', 1.0),
-            top_k=getattr(args, 'top_k', -1),
-            repetition_penalty=getattr(args, 'repetition_penalty', 1.0),
-            stop=getattr(args, 'stop_words', None),
+            top_p=args.top_p,
+            top_k=args.top_k,
+            repetition_penalty=args.repetition_penalty,
+            presence_penalty=getattr(args, 'presence_penalty', 0.0),
+            frequency_penalty=getattr(args, 'frequency_penalty', 0.0),
+            stop=getattr(args, 'stop', None),
             return_details=True,
             logprobs=True,
             structured_outputs_regex=structured_outputs_regex)
+        self._mopd_domain_generation = getattr(args, 'mopd_domain_generation_config', None) or {}
+
+        if not getattr(MegatronRolloutMixin, '_sampling_logged', False):
+            MegatronRolloutMixin._sampling_logged = True
+            rc = self.request_config
+            logger.info(
+                '[MOPD rollout sampling] final RequestConfig sent to vLLM: '
+                f'temperature={rc.temperature} top_p={rc.top_p} '
+                f'top_k={"disabled(-1)" if rc.top_k == -1 else rc.top_k} '
+                f'repetition_penalty={rc.repetition_penalty} '
+                f'presence_penalty={rc.presence_penalty} '
+                f'frequency_penalty={rc.frequency_penalty} '
+                f'n={rc.n} max_tokens={rc.max_tokens} '
+                f'stop={rc.stop} '
+                f'logprobs={rc.logprobs} structured_outputs_regex={rc.structured_outputs_regex}')
 
         self._last_loaded_step = -1
         self._step = 0
@@ -371,6 +428,9 @@ class MegatronRolloutMixin:
         # Load model weights if needed
         if self._step != self._last_loaded_step or self.args.sleep_level == 2:
             self._move_model_to_vllm()
+            # Only the coordinator talks to the server. Other train ranks
+            # must not generate or claim freshness before all load ACKs.
+            torch.distributed.barrier()
             self._last_loaded_step = self._step
 
         context = self.offload_context if self.enable_offload else nullcontext
@@ -429,13 +489,17 @@ class MegatronRolloutMixin:
             return []
 
         if self.is_main_process:
+            if self.args.mopd_router_replay == 'r3':
+                self.vllm_client.require_routing_replay()
+            if self._mopd_domain_generation:
+                self.vllm_client.require_domain_generation()
             all_outputs: List[RolloutOutput] = self.vllm_client.infer(
                 infer_requests=all_requests, request_config=request_config)
             assert len(all_outputs) == len(all_requests)
         else:
             all_outputs = [None] * len(all_requests)
 
-        all_outputs = broadcast_object_list(all_outputs, from_process=self.world_size - 1)
+        all_outputs = broadcast_object_list(all_outputs, from_process=self._main_process_rank)
         start_idx = sum(all_requests_lengths[:self.process_index])
         end_idx = start_idx + all_requests_lengths[self.process_index]
         outputs = all_outputs[start_idx:end_idx]
@@ -493,12 +557,13 @@ class MegatronRolloutMixin:
     def _inputs_to_requests(self, inputs: DataType) -> List[RolloutInferRequest]:
         """Convert raw input data into RolloutInferRequest objects."""
 
-        def _process_image_data(image_data: Union[dict, str]) -> str:
+        def _process_image_data(image_data: Union[dict, str]) -> Union[dict, str]:
+            from swift.llm.template.image_budget import split_image_entry
             if isinstance(image_data, dict):
-                if image_data.get('bytes'):
-                    return base64.b64encode(image_data['bytes']).decode('utf-8')
-                if image_data.get('path'):
-                    return image_data['path']
+                source, budget = split_image_entry(image_data)
+                if isinstance(source, bytes):
+                    source = base64.b64encode(source).decode('utf-8')
+                return {'path': source, **budget} if budget else source
             return image_data
 
         if not inputs:
@@ -529,6 +594,11 @@ class MegatronRolloutMixin:
                     pass
 
             request_obj = from_dict(RolloutInferRequest, request_data)
+            if self._mopd_domain_generation:
+                from swift.llm.infer.mopd_generation import MOPD_GENERATION_INFO_KEY, generation_for_domain
+                request_obj.data_dict[MOPD_GENERATION_INFO_KEY] = generation_for_domain(
+                    data.get('domain'), self._mopd_domain_generation,
+                    max_tokens=self.max_completion_length, temperature=self.temperature)
             requests_list.append(request_obj)
 
         return requests_list
@@ -570,7 +640,25 @@ class MegatronRolloutMixin:
             return input_data
 
         assert len(inputs) == len(outputs)
-        return [merge_output(inp, out) for inp, out in zip(inputs, outputs)]
+        results = [merge_output(inp, out) for inp, out in zip(inputs, outputs)]
+        if getattr(self, '_mopd_domain_generation', None):
+            from swift.llm.infer.mopd_generation import (
+                MOPD_GENERATION_INFO_KEY, generation_for_domain, validate_generation_ack)
+            for result, output in zip(results, outputs):
+                expected = generation_for_domain(
+                    result.get('domain'), self._mopd_domain_generation,
+                    max_tokens=self.max_completion_length, temperature=self.temperature)
+                result['_mopd_generation'] = validate_generation_ack(
+                    expected, (output.rollout_infos or {}).get(MOPD_GENERATION_INFO_KEY))
+                token_ids = result.get('response_token_ids') or []
+                actual_tokens = (sum(len(turn) for turn in token_ids)
+                                 if token_ids and isinstance(token_ids[0], (list, tuple)) else len(token_ids))
+                if actual_tokens > result['_mopd_generation']['max_tokens']:
+                    raise RuntimeError(
+                        f'vLLM exceeded its acknowledged response budget for domain={result.get("domain")!r}: '
+                        f'{actual_tokens} > {result["_mopd_generation"]["max_tokens"]}')
+        _assert_rollout_token_logprob_alignment(results)
+        return results
 
     @contextmanager
     def offload_context(self):

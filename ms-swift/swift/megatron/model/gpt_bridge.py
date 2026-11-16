@@ -1408,6 +1408,14 @@ class GPTBridge:
         self._is_peft_format = is_peft_format
         self._adapter_name = adapter_name
         hf_model_dir = safe_snapshot_download(hf_model_dir, use_hf=self.args.use_hf, hub_token=self.args.hub_token)
+        if getattr(self.args, 'mopd_model_cache_dir', None):
+            from .weight_cache import load_cached_weights
+            return load_cached_weights(
+                self, mg_model, hf_model_dir,
+                lambda: self._load_hf_weights(mg_model, hf_model_dir, is_peft_format))
+        self._load_hf_weights(mg_model, hf_model_dir, is_peft_format)
+
+    def _load_hf_weights(self, mg_model, hf_model_dir, is_peft_format):
         with torch.no_grad(), SafetensorLazyLoader(hf_model_dir, is_peft_format=is_peft_format) as loader:
             state_dict = loader.get_state_dict()
             hf_prefix = 'base_model.model.' if is_peft_format else ''

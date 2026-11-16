@@ -1,6 +1,7 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 import os
 from dataclasses import dataclass
+from typing import Literal, Optional
 
 import json
 
@@ -15,7 +16,45 @@ logger = get_logger()
 class MegatronTrainArguments(MegatronBaseArguments):
     add_version: bool = True
     load_args: bool = False
+    # TP/PP/CP replicas must not independently substitute different SFT rows.
+    # Lazy encoding retries transient I/O in place, then stops on bad input.
+    strict: bool = True
+    # 'r2' also applies to SFT; 'r3' requires synchronous on-policy GKD rollouts.
+    mopd_router_replay: Literal['disabled', 'r2', 'r3'] = 'disabled'
+    # Auto preserves the existing TE selector. Version 2 is opt-in for the
+    # validated BF16 SFT/GKD kernel recipe; serving remains unchanged.
+    mopd_train_flash_attention_version: Literal['auto', '2'] = 'auto'
+    # Model-only rank-local conversion cache. Never a resume/optimizer cache.
+    mopd_model_cache_dir: Optional[str] = None
+    mopd_model_cache_reserve_gb: int = 128
 
+    def _validate_train_flash_attention(self):
+        choice = self.mopd_train_flash_attention_version
+        if choice == 'auto':
+            return
+        if (choice != '2' or self.rlhf_type not in (None, 'gkd') or self.attention_backend != 'flash'
+                or self.pipeline_model_parallel_size != 1 or self.context_parallel_size != 1):
+            raise ValueError(
+                'mopd_train_flash_attention_version=2 currently requires SFT/GKD, '
+                'attention_backend=flash and PP1/CP1.')
+
+    def _validate_router_replay(self):
+        mode = self.mopd_router_replay
+        if mode == 'disabled':
+            return
+        if mode not in ('r2', 'r3'):
+            raise ValueError(f'Unsupported mopd_router_replay={mode!r}.')
+        if self.rlhf_type not in (None, 'gkd'):
+            raise ValueError('mopd_router_replay currently supports SFT and GKD only.')
+        if (self.pipeline_model_parallel_size != 1 or self.context_parallel_size != 1
+                or self.micro_batch_size != 1 or self.overlap_rollout_training
+                or self.use_sft_loss or self.mtp_num_layers):
+            raise ValueError(
+                'mopd_router_replay requires synchronous PP1/CP1, micro_batch_size=1, '
+                'no independent SFT stream and no MTP.')
+        if mode == 'r3' and (self.rlhf_type != 'gkd' or not self.use_vllm
+                             or self.vllm_mode != 'server' or self.lmbda != 1 or self.seq_kd):
+            raise ValueError('R3 requires on-policy GKD with lambda=1 and a student vLLM server.')
     def _init_save(self):
         init_process_group(backend=self.ddp_backend, timeout=self.ddp_timeout)
         if self.save is None:
@@ -38,8 +77,16 @@ class MegatronTrainArguments(MegatronBaseArguments):
             self.model = old_args.get('model')
 
     def __post_init__(self):
+        if self.mopd_model_cache_dir is not None:
+            if (not os.path.isabs(self.mopd_model_cache_dir)
+                    or self.train_type != 'full' or self.rlhf_type not in (None, 'gkd')
+                    or type(self.mopd_model_cache_reserve_gb) is not int
+                    or self.mopd_model_cache_reserve_gb < 0):
+                raise ValueError('Converted weights require an absolute cache directory, full SFT/GKD and nonnegative headroom')
         self.load = to_abspath(self.load, check_path_exist=True)
         super().__post_init__()
+        self._validate_router_replay()
+        self._validate_train_flash_attention()
         if len(self.dataset) == 0 and len(self.cached_dataset) == 0:
             raise ValueError(f'self.dataset: {self.dataset}, self.cached_dataset: {self.cached_dataset}. '
                              'Please input the training dataset.')
