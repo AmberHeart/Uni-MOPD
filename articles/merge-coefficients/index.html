@@ -1,0 +1,104 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><script>
+      // Apply the stored theme before first paint; without one, follow the system.
+      (() => {
+        const stored = localStorage.getItem("theme");
+        const dark = stored
+          ? stored === "dark"
+          : matchMedia("(prefers-color-scheme: dark)").matches;
+        document.documentElement.dataset.theme = dark ? "dark" : "light";
+      })();
+    </script><title>Are merge coefficients worth tuning before distillation? · Uni-MOPD</title><link rel="icon" type="image/svg+xml" href="/Uni-MOPD/assets/logo/uni-mopd-favicon.svg"><link rel="icon" type="image/png" sizes="32x32" href="/Uni-MOPD/assets/logo/uni-mopd-favicon-32.png"><link rel="apple-touch-icon" href="/Uni-MOPD/assets/logo/apple-touch-icon.png"><meta name="description" content="Hand-tuned and calibrated merges move the score before MOPD by −2.0 to +1.1 points; after 50 updates the best of them are level with the uniform merge. Lower calibration loss does not pick a better start. The total scale is what can break a merge, and MOPD repairs it."><link rel="canonical" href="https://amberheart.github.io/Uni-MOPD/articles/merge-coefficients/"><meta property="og:type" content="article"><meta property="og:title" content="Are merge coefficients worth tuning before distillation?"><meta property="og:description" content="Hand-tuned and calibrated merges move the score before MOPD by −2.0 to +1.1 points; after 50 updates the best of them are level with the uniform merge. Lower calibration loss does not pick a better start. The total scale is what can break a merge, and MOPD repairs it."><meta property="og:url" content="https://amberheart.github.io/Uni-MOPD/articles/merge-coefficients/"><meta name="twitter:card" content="summary_large_image"><link rel="stylesheet" href="/Uni-MOPD/_astro/BaseLayout.TS5X_SpH.css"></head><body><nav class="site-nav"><div class="wrap site-nav__inner"><a class="site-nav__brand" href="/Uni-MOPD/"><img class="logo-light" src="/Uni-MOPD/assets/logo/uni-mopd-mark.svg" alt="" width="22" height="22"><img class="logo-dark" src="/Uni-MOPD/assets/logo/uni-mopd-mark-dark.svg" alt="" width="22" height="22">Uni-MOPD</a><div class="site-nav__links"><a href="/Uni-MOPD/#method">Method</a><a href="/Uni-MOPD/#results">Results</a><a href="/Uni-MOPD/articles/">Research notes</a><a href="/Uni-MOPD/#quickstart">Quick start</a></div><button class="theme-toggle" type="button" aria-label="Switch between light and dark mode" title="Light / dark" data-theme-toggle><svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"></path></svg><svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"></path></svg></button></div></nav><script type="module">document.querySelector(`[data-theme-toggle]`)?.addEventListener(`click`,()=>{let e=document.documentElement,t=e.dataset.theme===`dark`?`light`:`dark`;e.dataset.theme=t,localStorage.setItem(`theme`,t)});</script><div class="page-grid page-grid--article"><aside class="toc" aria-label="Contents"><p class="toc__title">Contents</p><ol><li><a href="#the-uniform-merge-matches-calibrated-starts" data-toc-link>The uniform merge matches calibrated starts</a></li><li><a href="#lower-calibration-loss-does-not-pick-a-better-start" data-toc-link>Lower calibration loss does not pick a better start</a></li><li><a href="#what-the-calibrated-merges-give-up" data-toc-link>What the calibrated merges give up</a></li><li><a href="#the-total-scale-can-break-a-merge" data-toc-link>The total scale can break a merge</a></li><li><a href="#dare-versus-plain-averaging" data-toc-link>DARE versus plain averaging</a></li><li><a href="#in-practice" data-toc-link>In practice</a></li><li><a href="#related-notes" data-toc-link>Related notes</a></li></ol><a class="toc__back" href="/Uni-MOPD/">↑ Project page</a></aside><script type="module">var e=[...document.querySelectorAll(`[data-toc-link]`)],t=e.map(e=>document.getElementById(decodeURIComponent(e.hash.slice(1)))).filter(e=>e!==null);if(t.length){let n=()=>{let n=t[0];for(let e of t)e.getBoundingClientRect().top-120<=0&&(n=e);for(let t of e)t.classList.toggle(`is-active`,decodeURIComponent(t.hash.slice(1))===n.id)};document.addEventListener(`scroll`,n,{passive:!0}),n()}</script><main class="page-main"><details class="toc-mobile"><summary>Contents</summary><ol><li><a href="#the-uniform-merge-matches-calibrated-starts">The uniform merge matches calibrated starts</a></li><li><a href="#lower-calibration-loss-does-not-pick-a-better-start">Lower calibration loss does not pick a better start</a></li><li><a href="#what-the-calibrated-merges-give-up">What the calibrated merges give up</a></li><li><a href="#the-total-scale-can-break-a-merge">The total scale can break a merge</a></li><li><a href="#dare-versus-plain-averaging">DARE versus plain averaging</a></li><li><a href="#in-practice">In practice</a></li><li><a href="#related-notes">Related notes</a></li></ol></details><article><nav class="crumbs" aria-label="Breadcrumb"><a href="/Uni-MOPD/">Uni-MOPD</a> / <a href="/Uni-MOPD/articles/">Research notes</a></nav><header class="article-head"><h1>Are merge coefficients worth tuning before distillation?</h1><p class="article-dek">Hand-tuned and calibrated merges move the score before MOPD by −2.0 to +1.1 points; after 50 updates the best of them are level with the uniform merge. Lower calibration loss does not pick a better start. The total scale is what can break a merge, and MOPD repairs it.</p></header><div class="prose"><p>Not if you distill afterwards. Searching or fitting the merge coefficients moves
+the score before MOPD by −2.0 to +1.1 points, but after 50 MOPD updates the best
+searched merges are level with the uniform one. Uniform weights are not the
+optimal merge and need not be; what matters is the total scale.</p>
+<h2 id="the-uniform-merge-matches-calibrated-starts">The uniform merge matches calibrated starts</h2>
+<p>We compared the uniform merge (every coefficient 0.2) with two kinds of search.
+The <strong>tuned merge</strong> is the best of a manual search that up-weights the two
+strongest specialists, OCR and GUI, and checks every candidate on all 19
+benchmarks, which makes it costly and a deliberately strong reference.
+<strong>Calibrated merges</strong> fit the five coefficients offline to the teachers, without
+using benchmark scores.</p>
+<p>Short MOPD narrows the differences: across the nine merges we continued, a
+3.1-point spread before MOPD shrinks to 1.1 after 50 updates. Merges that start
+ahead give back their lead, and weaker ones catch up; PGD@5 and PGD@8 reach 69.5
+and 69.7 at update 200, against 69.4 for the uniform run.</p>
+<figure class="figure-wide"><div class="figure-scroll"><a class="figure-zoom" href="/Uni-MOPD/assets/figures/calibrated-merges.png" target="_blank" rel="noopener" aria-label="Open the figure at full size"><img src="/Uni-MOPD/assets/figures/calibrated-merges.png" alt="Left: slope chart of the nine continued merges before MOPD and after 50 updates. Before MOPD the scores range from 65.6 (PGD@5) to 68.7 (CE@10 and FKL@7), with the uniform merge at 67.6; after 50 updates all nine lie between 68.8 and 69.9. Right: the average score of each merge at every evaluated checkpoint through update 50." loading="lazy"></a></div><figcaption><p><strong>Nine merges, before and after 50 updates.</strong> (a) The 3.1-point spread before MOPD shrinks to 1.1. (b) Evaluated checkpoints; the calibrated merges are first evaluated at update 10.</p></figcaption></figure>
+<figure><div class="figure-scroll"><a class="figure-zoom" href="/Uni-MOPD/assets/figures/calibration-transfer.png" target="_blank" rel="noopener" aria-label="Open the figure at full size"><img src="/Uni-MOPD/assets/figures/calibration-transfer.png" alt="Left: along the PGD path, calibration reverse KL falls from 0.73 to 0.44 while the score before MOPD falls from 67.6 to between 65.6 and 67.3. Right: average score over 50 MOPD updates from the uniform merge and calibrated starts, which end close together." loading="lazy"></a></div><figcaption><p><strong>Offline calibration.</strong> (a) Lower calibration loss does not give
+a higher score before MOPD. (b) Calibrated starts move toward the uniform
+merge under MOPD.</p></figcaption></figure>
+<h2 id="lower-calibration-loss-does-not-pick-a-better-start">Lower calibration loss does not pick a better start</h2>
+<p>Along the PGD path the calibration loss falls from 0.73 to 0.44, yet the score
+before MOPD does not improve and drops to 65.6 at PGD@5. The loss is measured on
+responses the teachers wrote, whereas the benchmarks score responses the merged
+model writes itself. The coefficients show what the loss rewards.</p>
+<figure><div class="figure-scroll"><a class="figure-zoom" href="/Uni-MOPD/assets/figures/calibration-coefficient-paths.png" target="_blank" rel="noopener" aria-label="Open the figure at full size"><img src="/Uni-MOPD/assets/figures/calibration-coefficient-paths.png" alt="Merge coefficients for the five specialists along PGD calibration from three initial total strengths, 1, 1.5 and 2. In all three, the STEM and VQA coefficients fall to near zero while OCR, GUI and embodied rise; a fourth panel shows the fitting loss converging to about 0.44 from all three starts." loading="lazy"></a></div><figcaption><p><strong>Coefficient paths under PGD calibration</strong> from three initial
+total strengths. “Fit RKL” is the calibration loss.</p></figcaption></figure>
+<div class="scope"><b>Scope.</b> <p>PGD calibration from three initial strengths; only the strength-1 path was
+continued with MOPD.</p></div>
+<p>From every initial strength, the fit pushed the STEM and VQA coefficients toward
+zero and grew the other three, ending at about the same loss. A likely reason is
+that lowering the average loss on teacher trajectories is served by giving up two
+domains to serve three, and nothing in the loss sees what this does to
+generation. The paper’s four-objective study points the same way: the
+reverse-KL fit drives the VQA coefficient to 0.05 and costs 0.7 points, while
+cross-entropy and forward KL, which gain 1.1, stay close to the tuned merge.</p>
+<h2 id="what-the-calibrated-merges-give-up">What the calibrated merges give up</h2>
+<p>The coefficients also show which benchmarks pay. Before MOPD, PGD@8 loses 10.5
+points on MMMU-Pro against the uniform merge, and PGD@5 loses 18.2 on MathVision
+and 11.5 on MMMU-Pro. The STEM specialist leads on both benchmarks (64.5 and
+68.4), and the fit shrank its coefficient. Both merges also lose about 10 points
+on CharXiv (9.7 and 10.2) and gain 2.8 to 4.3 on ScreenSpot-Pro and OSWorld-G,
+where the GUI and OCR specialists lead and the fit grew their coefficients.</p>
+<p>Short MOPD repairs the STEM side: after 50 updates PGD@8 is 1.2 below the
+uniform merge on MMMU-Pro and 0.8 above on MathVision. The remaining deficits
+lie on the other shrunken coefficient. PGD@8 and PGD@5 still trail on MUIRBench
+by 4.2 and 3.9 and on TreeBench by 4.9 and 4.4, the two benchmarks where the VQA
+specialist leads (74.7 and 48.6), and both keep their lead on ScreenSpot-Pro
+(3.0 and 2.5). One reading is that the shrunken VQA coefficient leaves less of
+the VQA specialist in these starts, and 50 updates restore the STEM side but not
+yet this one.</p>
+<figure class="figure-wide"><div class="figure-scroll"><a class="figure-zoom" href="/Uni-MOPD/assets/figures/merge-variants-delta.png" target="_blank" rel="noopener" aria-label="Open the figure at full size"><img src="/Uni-MOPD/assets/figures/merge-variants-delta.png" alt="Two heatmaps of benchmark score differences from the uniform merge for Multi-Domain SFT, the OCR-specialist start, the tuned merge, and the PGD@8 and PGD@5 calibrated merges. Before MOPD the PGD rows lose 10 to 18 points on MMMU-Pro, MathVision and CharXiv and gain 3 to 4 points on ScreenSpot-Pro and OSWorld-G. After 50 updates the STEM losses are repaired, while MUIRBench and TreeBench remain 4 to 5 points below the uniform merge." loading="lazy"></a></div><figcaption><p><strong>Score difference from the uniform merge</strong>, (a) before MOPD and (b) after 50 updates, for the PGD@8 and PGD@5 merges and the other starts. Blue: below the uniform merge, brown: above.</p></figcaption></figure>
+<div class="scope"><b>Scope.</b> <p>PGD@8 and PGD@5 from the uniform merge, one seed each; differences from the
+uniform merge on single benchmarks, before MOPD and at update 50.</p></div>
+<h2 id="the-total-scale-can-break-a-merge">The total scale can break a merge</h2>
+<p>The shape of the coefficients barely matters after distillation, but their sum
+can break the merge outright.</p>
+<ul>
+<li><strong>The score peaks between scale 1 and 1.25.</strong> On a 13-benchmark subset, 1.25
+is slightly ahead of scale 1 (61.7 vs. 61.3), and 0.75 is 1.9 points lower.</li>
+<li><strong>At scale 2</strong> the 19-benchmark average falls from 67.6 to 61.2, and the mean
+response grows from 787 to 6,587 tokens.</li>
+<li><strong>At scale 3</strong> answers run to tens of thousands of tokens; in our evaluations
+MathVision, CharXiv and ScreenSpot-v2 fall to 4.7, 0.8 and 11.1.</li>
+</ul>
+<figure><div class="figure-scroll"><a class="figure-zoom" href="/Uni-MOPD/assets/figures/scale-droprate.png" target="_blank" rel="noopener" aria-label="Open the figure at full size"><img src="/Uni-MOPD/assets/figures/scale-droprate.png" alt="Left: score before MOPD on a 13-benchmark subset against the total merge scale: 59.5 at 0.75, 61.3 at 1, 61.7 at 1.25 and 56.2 at 2. Right: the same score against the DARE drop rate at scale 1: 61.2 at 0, 61.3 at 0.3, 61.4 at 0.5, 61.3 at 0.7 and 61.7 at 0.9." loading="lazy"></a></div><figcaption><p><strong>Total scale and DARE drop rate.</strong> (a) The score is highest at a total
+scale of 1 to 1.25 and falls sharply at 2. (b) At scale 1 the drop rate barely
+matters.</p></figcaption></figure>
+<figure><div class="figure-scroll"><a class="figure-zoom" href="/Uni-MOPD/assets/figures/overscale-repair.png" target="_blank" rel="noopener" aria-label="Open the figure at full size"><img src="/Uni-MOPD/assets/figures/overscale-repair.png" alt="Three panels. (a) Mean response tokens at scale 1 and scale 3 on BabyVision (353 against 19,699), MathVision (3,467 against 9,869) and MMMU-Pro 10-option (4,803 against 30,766). (b) Average score after 50 to 200 MOPD updates: the scale-3 merge rises from 66.4 to 68.9, below the main run but above the base model after 200 updates and above the tuned merge before MOPD. (c) Mean rollout length per domain early and late in the first 50 updates of the scale-3 run, for example GUI 685 to 88 tokens." loading="lazy"></a></div><figcaption><p><strong>An overscaled merge and its repair.</strong> Responses run away before
+training and come back during it.</p></figcaption></figure>
+<p>MOPD repairs the collapse, slowly. The scale-3 merge is at 66.4 after 50 updates
+and 68.9 after 150, back among the strong starts but still 0.6 below the main
+run at update 200. During training we observed the rollouts shorten within the
+first few dozen updates, most in GUI. An overscaled merge thus costs updates and
+part of the final score; a scale near one costs neither.</p>
+<div class="scope"><b>Scope.</b> <p>Rollout lengths measured during training of the scale-3 run, one seed.</p></div>
+<h2 id="dare-versus-plain-averaging">DARE versus plain averaging</h2>
+<p>DARE drops a random fraction <span class="katex"><span class="katex-html" aria-hidden="true"><span class="katex-base"><span class="katex-strut" style="height:0.6944em"></span><span class="mord mathnormal">λ</span></span></span></span> of each task vector and rescales the rest
+by <span class="katex"><span class="katex-html" aria-hidden="true"><span class="katex-base"><span class="katex-strut" style="height:1em;vertical-align:-0.25em"></span><span class="mord">1/</span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em"></span></span><span class="katex-base"><span class="katex-strut" style="height:1em;vertical-align:-0.25em"></span><span class="mord mathnormal">λ</span><span class="mclose">)</span></span></span></span>; with <span class="katex"><span class="katex-html" aria-hidden="true"><span class="katex-base"><span class="katex-strut" style="height:0.6944em"></span><span class="mord mathnormal">λ</span><span class="mspace" style="margin-right:0.2778em"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em"></span></span><span class="katex-base"><span class="katex-strut" style="height:0.6444em"></span><span class="mord">0</span></span></span></span> the merge is plain averaging. At scale 1,
+every drop rate we tried scores at least as high as averaging (panel b of the first
+scale figure above).</p>
+<p>Even dropping 90% of every task vector does not hurt. Our reading is that the
+specialists’ updates are largely redundant. The main comparisons use
+<span class="katex"><span class="katex-html" aria-hidden="true"><span class="katex-base"><span class="katex-strut" style="height:0.6944em"></span><span class="mord mathnormal">λ</span><span class="mspace" style="margin-right:0.2778em"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em"></span></span><span class="katex-base"><span class="katex-strut" style="height:0.6444em"></span><span class="mord">0.7</span></span></span></span>.</p>
+<h2 id="in-practice">In practice</h2>
+<ul>
+<li>Use uniform weights at total scale one, and skip the coefficient search if you
+are going to distill.</li>
+<li>Don’t choose coefficients by a calibration loss on teacher outputs.</li>
+<li>If a merge produces runaway responses, check the coefficient sum first.</li>
+</ul>
+<h2 id="related-notes">Related notes</h2>
+<ul>
+<li><a href="/Uni-MOPD/articles/where-to-start/">Where should a multi-teacher distillation student start?</a></li>
+<li><a href="/Uni-MOPD/articles/what-distillation-adds/">What does distillation add to a strong start?</a></li>
+</ul></div><nav class="pager"><a href="/Uni-MOPD/articles/where-to-start/">← Where to start</a><a href="/Uni-MOPD/articles/what-distillation-adds/">What distillation adds →</a></nav></article></main></div><footer class="site-footer"><div class="wrap"><p><a href="/Uni-MOPD/">Uni-MOPD</a></p></div></footer></body></html>

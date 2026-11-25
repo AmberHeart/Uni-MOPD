@@ -1,0 +1,181 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><script>
+      // Apply the stored theme before first paint; without one, follow the system.
+      (() => {
+        const stored = localStorage.getItem("theme");
+        const dark = stored
+          ? stored === "dark"
+          : matchMedia("(prefers-color-scheme: dark)").matches;
+        document.documentElement.dataset.theme = dark ? "dark" : "light";
+      })();
+    </script><title>Where should a multi-teacher distillation student start? · Uni-MOPD</title><link rel="icon" type="image/svg+xml" href="/Uni-MOPD/assets/logo/uni-mopd-favicon.svg"><link rel="icon" type="image/png" sizes="32x32" href="/Uni-MOPD/assets/logo/uni-mopd-favicon-32.png"><link rel="apple-touch-icon" href="/Uni-MOPD/assets/logo/apple-touch-icon.png"><meta name="description" content="Base, Multi-Domain SFT, merges and the strongest single specialist under the same MOPD run, read benchmark by benchmark. A training-free uniform merge starts where the base model ends after 200 updates, and the starts differ far less after 50 updates than before."><link rel="canonical" href="https://amberheart.github.io/Uni-MOPD/articles/where-to-start/"><meta property="og:type" content="article"><meta property="og:title" content="Where should a multi-teacher distillation student start?"><meta property="og:description" content="Base, Multi-Domain SFT, merges and the strongest single specialist under the same MOPD run, read benchmark by benchmark. A training-free uniform merge starts where the base model ends after 200 updates, and the starts differ far less after 50 updates than before."><meta property="og:url" content="https://amberheart.github.io/Uni-MOPD/articles/where-to-start/"><meta name="twitter:card" content="summary_large_image"><link rel="stylesheet" href="/Uni-MOPD/_astro/BaseLayout.TS5X_SpH.css"></head><body><nav class="site-nav"><div class="wrap site-nav__inner"><a class="site-nav__brand" href="/Uni-MOPD/"><img class="logo-light" src="/Uni-MOPD/assets/logo/uni-mopd-mark.svg" alt="" width="22" height="22"><img class="logo-dark" src="/Uni-MOPD/assets/logo/uni-mopd-mark-dark.svg" alt="" width="22" height="22">Uni-MOPD</a><div class="site-nav__links"><a href="/Uni-MOPD/#method">Method</a><a href="/Uni-MOPD/#results">Results</a><a href="/Uni-MOPD/articles/">Research notes</a><a href="/Uni-MOPD/#quickstart">Quick start</a></div><button class="theme-toggle" type="button" aria-label="Switch between light and dark mode" title="Light / dark" data-theme-toggle><svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"></path></svg><svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"></path></svg></button></div></nav><script type="module">document.querySelector(`[data-theme-toggle]`)?.addEventListener(`click`,()=>{let e=document.documentElement,t=e.dataset.theme===`dark`?`light`:`dark`;e.dataset.theme=t,localStorage.setItem(`theme`,t)});</script><div class="page-grid page-grid--article"><aside class="toc" aria-label="Contents"><p class="toc__title">Contents</p><ol><li><a href="#a-training-free-merge-starts-where-base-ends" data-toc-link>A training-free merge starts where Base ends</a></li><li><a href="#spiky-specialists-flat-merge" data-toc-link>Spiky specialists, flat merge</a></li><li><a href="#nineteen-benchmarks-four-starts" data-toc-link>Nineteen benchmarks, four starts</a></li><li><a href="#starts-differ-before-mopd-and-much-less-after" data-toc-link>Starts differ before MOPD, and much less after</a></li><li><a href="#strong-not-optimal" data-toc-link>Strong, not optimal</a></li><li><a href="#a-second-specialist-bank" data-toc-link>A second specialist bank</a></li><li><a href="#in-practice" data-toc-link>In practice</a></li><li><a href="#related-notes" data-toc-link>Related notes</a></li></ol><a class="toc__back" href="/Uni-MOPD/">↑ Project page</a></aside><script type="module">var e=[...document.querySelectorAll(`[data-toc-link]`)],t=e.map(e=>document.getElementById(decodeURIComponent(e.hash.slice(1)))).filter(e=>e!==null);if(t.length){let n=()=>{let n=t[0];for(let e of t)e.getBoundingClientRect().top-120<=0&&(n=e);for(let t of e)t.classList.toggle(`is-active`,decodeURIComponent(t.hash.slice(1))===n.id)};document.addEventListener(`scroll`,n,{passive:!0}),n()}</script><main class="page-main"><details class="toc-mobile"><summary>Contents</summary><ol><li><a href="#a-training-free-merge-starts-where-base-ends">A training-free merge starts where Base ends</a></li><li><a href="#spiky-specialists-flat-merge">Spiky specialists, flat merge</a></li><li><a href="#nineteen-benchmarks-four-starts">Nineteen benchmarks, four starts</a></li><li><a href="#starts-differ-before-mopd-and-much-less-after">Starts differ before MOPD, and much less after</a></li><li><a href="#strong-not-optimal">Strong, not optimal</a></li><li><a href="#a-second-specialist-bank">A second specialist bank</a></li><li><a href="#in-practice">In practice</a></li><li><a href="#related-notes">Related notes</a></li></ol></details><article><nav class="crumbs" aria-label="Breadcrumb"><a href="/Uni-MOPD/">Uni-MOPD</a> / <a href="/Uni-MOPD/articles/">Research notes</a></nav><header class="article-head"><h1>Where should a multi-teacher distillation student start?</h1><p class="article-dek">Base, Multi-Domain SFT, merges and the strongest single specialist under the same MOPD run, read benchmark by benchmark. A training-free uniform merge starts where the base model ends after 200 updates, and the starts differ far less after 50 updates than before.</p></header><div class="prose"><p>Most MOPD work starts the student from the base model or a multi-domain SFT
+checkpoint and leaves much of the integration to distillation. When the
+specialists share a base model, merging them first is a better start: the merge
+scores 67.6 on our 19-benchmark average before any training, within 0.1 points
+of what the base model reaches after 200 distillation updates. Among strong
+starts, a higher initial score does not give a better final model, and no start
+wins on most benchmarks.</p>
+<h2 id="a-training-free-merge-starts-where-base-ends">A training-free merge starts where Base ends</h2>
+<p>Every start gets the same distillation run: same queries, same five teachers,
+same full-vocabulary reverse KL. Only the starting weights change.</p>
+<figure><div class="figure-scroll"><a class="figure-zoom" href="/Uni-MOPD/assets/figures/initialization-overview.png" target="_blank" rel="noopener" aria-label="Open the figure at full size"><img src="/Uni-MOPD/assets/figures/initialization-overview.png" alt="Average score of five starts over 200 MOPD updates: Base rises from 58.1 to 67.7, Multi-Domain SFT from 65.9 to 69.8, the tuned merge starts at 68.5 and the uniform merge at 67.6, both meeting near 69.5, and the OCR-specialist start begins at 68.4 and is evaluated to update 50. A dashed line marks the best-specialist reference at 70.9." loading="lazy"></a></div><figcaption><p><strong>Five starts under the same MOPD run.</strong> Each line is a run from
+that start. The strong starts meet within 50 updates; the base model never
+reaches them.</p></figcaption></figure>
+<table>
+<thead>
+<tr>
+<th>Start</th>
+<th style="text-align:right">Before MOPD</th>
+<th style="text-align:right">After 50 updates</th>
+<th style="text-align:right">After 200 updates</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Base</td>
+<td style="text-align:right">58.1</td>
+<td style="text-align:right">66.5</td>
+<td style="text-align:right">67.7</td>
+</tr>
+<tr>
+<td>Multi-Domain SFT</td>
+<td style="text-align:right">65.9</td>
+<td style="text-align:right">69.0</td>
+<td style="text-align:right">69.8</td>
+</tr>
+<tr>
+<td>Tuned merge</td>
+<td style="text-align:right">68.5</td>
+<td style="text-align:right">69.8</td>
+<td style="text-align:right">69.4</td>
+</tr>
+<tr>
+<td>OCR specialist</td>
+<td style="text-align:right">68.4</td>
+<td style="text-align:right">69.7</td>
+<td style="text-align:right">—</td>
+</tr>
+<tr>
+<td><strong>Uniform merge</strong></td>
+<td style="text-align:right">67.6</td>
+<td style="text-align:right"><strong>69.8</strong></td>
+<td style="text-align:right">69.4</td>
+</tr>
+<tr>
+<td>Best-specialist reference</td>
+<td style="text-align:right">70.9</td>
+<td style="text-align:right"></td>
+<td style="text-align:right"></td>
+</tr>
+</tbody>
+</table>
+<p>The best-specialist reference is a hypothetical model that matches the
+strongest specialist in every domain. The merge covers 74% of the distance from
+the base model to it before training, and 92% after 50 updates.</p>
+<h2 id="spiky-specialists-flat-merge">Spiky specialists, flat merge</h2>
+<p>A specialist leads its own domain and can fall far behind in others, which
+domain averages hide. The VQA specialist scores 17.6 on DocVQA, where every
+other model is above 91, and the STEM specialist scores 1.5 on ScreenSpot-Pro.</p>
+<figure class="figure-wide"><div class="figure-scroll"><a class="figure-zoom" href="/Uni-MOPD/assets/figures/start-benchmark-heatmap.png" target="_blank" rel="noopener" aria-label="Open the figure at full size"><img src="/Uni-MOPD/assets/figures/start-benchmark-heatmap.png" alt="Heatmap of 19 benchmark scores for the five specialists, Base, Multi-Domain SFT, the uniform merge and the tuned merge. Shading shows the score relative to the best specialist on that benchmark. Each specialist has dark cells in its own domain and pale cells elsewhere, such as the STEM specialist on the three GUI benchmarks and the VQA specialist on DocVQA. The two merge rows are dark on every benchmark except BabyVision." loading="lazy"></a></div><figcaption><p><strong>Nineteen benchmarks, before any training.</strong> Shading is the
+score relative to the best specialist on that benchmark.</p></figcaption></figure>
+<p>The merge flattens the spikes. On 15 of 19 benchmarks it reaches at least 90% of
+the best specialist’s score, and on OCRBench v2, ScreenSpot-v2, EmbSpatial-Bench,
+MMStar and DocVQA it is within 1% or above. The remaining gaps concentrate on
+four benchmarks: BabyVision (15.2 against 22.4), We-Math (64.4 against 77.0),
+RefSpatial (60.3 against 70.4) and CharXiv (57.2 against 65.8). We-Math,
+RefSpatial and CharXiv then receive the largest gains in the first 50 updates
+(<a href="/Uni-MOPD/articles/what-distillation-adds/">next note</a>); BabyVision gains 2.1 and keeps
+most of its gap. Merging needs a shared base model and vocabulary, so that the
+task vectors (specialist weights minus base weights) add up into a usable model.</p>
+<h2 id="nineteen-benchmarks-four-starts">Nineteen benchmarks, four starts</h2>
+<figure class="figure-wide"><div class="figure-scroll"><a class="figure-zoom" href="/Uni-MOPD/assets/figures/start-trajectories-a.png" target="_blank" rel="noopener" aria-label="Open the figure at full size"><img src="/Uni-MOPD/assets/figures/start-trajectories-a.png" alt="Eight panels, one per STEM and VQA benchmark, each showing the score of Base, Multi-Domain SFT, the uniform merge and the tuned merge at every checkpoint through 200 MOPD updates, with a dashed line at the domain specialist's score. Base starts below the others and rises toward them; the three strong starts interleave." loading="lazy"></a></div><figcaption><p><strong>STEM and VQA benchmarks.</strong> Each line is a run from that start;
+dashed: the domain specialist’s score. Where Base starts far below the others,
+the panel notes its first score.</p></figcaption></figure>
+<figure class="figure-wide"><div class="figure-scroll"><a class="figure-zoom" href="/Uni-MOPD/assets/figures/start-trajectories-b.png" target="_blank" rel="noopener" aria-label="Open the figure at full size"><img src="/Uni-MOPD/assets/figures/start-trajectories-b.png" alt="Eleven panels, one per OCR, GUI and embodied benchmark, each showing the score of Base, Multi-Domain SFT, the uniform merge and the tuned merge at every checkpoint through 200 MOPD updates, with a dashed line at the domain specialist's score." loading="lazy"></a></div><figcaption><p><strong>OCR, GUI and embodied benchmarks.</strong> Each line is a run from that
+start.</p></figcaption></figure>
+<ul>
+<li><strong>The strong starts interleave.</strong> Across Multi-Domain SFT, the uniform merge
+and the tuned merge, the mean per-benchmark gap between the best and the
+worst start is 3.0 points before MOPD, 1.4 after 50 updates and 1.3 after 200.
+At update 200 the best start differs by benchmark: Multi-Domain SFT leads on
+nine, the tuned merge on five, the uniform merge on four, Base on one.</li>
+<li><strong>Base closes most of its distance within 50 updates, but not all.</strong> At update
+50 it is still below all three strong starts on 15 of the 19 benchmarks, and
+trails the uniform merge by 11.0 points on CharXiv, 8.7 on RefSpatial, 7.6 on
+We-Math and 5.8 on MUIRBench.</li>
+<li><strong>The OCR benchmarks dip.</strong> For the uniform merge, DocVQA and OCRBench v2 fall
+to 93.4 and 63.8 at update 50 and recover only partly by update 200 (94.4 and
+65.8); the tuned merge and Multi-Domain SFT dip in the same direction. The OCR
+domain mean stays flat (77.0 before, 77.8 after 50 updates) because CharXiv
+rises by 7.0.</li>
+</ul>
+<p>The gap between the strong starts closes as soon as MOPD begins and stays closed.</p>
+<figure><div class="figure-scroll"><a class="figure-zoom" href="/Uni-MOPD/assets/figures/strong-start-spread.png" target="_blank" rel="noopener" aria-label="Open the figure at full size"><img src="/Uni-MOPD/assets/figures/strong-start-spread.png" alt="Left: average score of Multi-Domain SFT, the uniform merge and the tuned merge over 200 MOPD updates; they start between 65.9 and 68.5 and are level near 69.5 from update 75. Right: the gap between the best and worst of the three, as a mean over benchmarks and on the average score. The per-benchmark gap falls from 3.0 points at the start to 1.4 at update 50 and 1.3 at update 200; the gap on the average falls from 2.7 to 0.8 at update 50 and stays between 0.1 and 0.4 afterwards." loading="lazy"></a></div><figcaption><p><strong>The strong starts converge.</strong> (a) Average score of each start. (b) The gap between the best and the worst start, as a mean over the 19 benchmarks (black) and on the average score (brown).</p></figcaption></figure>
+<div class="scope"><b>Scope.</b> <p>Single seed per start; a domain mean varies by up to 0.7 between evaluations of
+the same checkpoint.</p></div>
+<h2 id="starts-differ-before-mopd-and-much-less-after">Starts differ before MOPD, and much less after</h2>
+<figure class="figure-wide"><div class="figure-scroll"><a class="figure-zoom" href="/Uni-MOPD/assets/figures/merge-variants-delta.png" target="_blank" rel="noopener" aria-label="Open the figure at full size"><img src="/Uni-MOPD/assets/figures/merge-variants-delta.png" alt="Two heatmaps of benchmark score differences from the uniform merge for Multi-Domain SFT, the OCR-specialist start, the tuned merge, and the PGD@8 and PGD@5 calibrated merges. Before MOPD the differences reach plus 11.0 and minus 18.2. After 50 updates most cells lie within one or two points of zero." loading="lazy"></a></div><figcaption><p><strong>Score difference from the uniform merge</strong>, (a) before MOPD and
+(b) after 50 updates. Blue: above the uniform merge, vermilion: below.
+Differences of a few points on a single benchmark are within re-evaluation variation.</p></figcaption></figure>
+<p>Before MOPD every start has a distinct profile. The OCR specialist leads on
+We-Math by 11.0 and CharXiv by 8.6 and trails on RefSpatial by 3.6; the tuned
+merge leads on ScreenSpot-Pro, OSWorld-G, MathVision and CharXiv by 3.4 to 3.8;
+the calibrated PGD merges give up about 10 points on MMMU-Pro and CharXiv
+(<a href="/Uni-MOPD/articles/merge-coefficients/">coefficient calibration</a>). After 50 updates the
+large differences are gone: 64 of the 95 differences are within 2 points before
+MOPD and 75 of 95 afterwards, and the largest shrinks from 18.2 to 4.9. What
+remains is tied to the start: Multi-Domain
+SFT and the OCR start still trail the merge on RefSpatial (by 3.6) and
+MMSI-Bench (by 2.6 and 2.5), and the PGD merges trail on MUIRBench and TreeBench.</p>
+<h2 id="strong-not-optimal">Strong, not optimal</h2>
+<p>The tuned merge starts 0.9 points ahead of the uniform merge and ends level with
+it, and Multi-Domain SFT starts 1.8 points behind and needs more than twice as
+many updates to reach the merge’s update-50 score. The strongest single
+specialist, the OCR specialist at 68.4, first loses ground: its STEM mean falls
+from 71.5 to 66.4 by update 20, and it reaches 69.7 only at update 50, while the
+merge rises steadily to 69.8.</p>
+<figure class="figure-wide"><div class="figure-scroll"><a class="figure-zoom" href="/Uni-MOPD/assets/figures/ocr-start-domains.png" target="_blank" rel="noopener" aria-label="Open the figure at full size"><img src="/Uni-MOPD/assets/figures/ocr-start-domains.png" alt="Six panels with the average and the five domain means over the first 50 updates for the uniform merge and the OCR-specialist start. The OCR start begins higher on the average and in STEM and OCR, drops in STEM during the first 20 updates, and ends at 69.7 against 69.8 for the merge; it ends higher on VQA and lower on Embodied." loading="lazy"></a></div><figcaption><p><strong>The OCR-specialist start and the uniform merge, by domain.</strong> Shading around the first series marks the re-evaluation variation.</p></figcaption></figure>
+<p>The same order holds under domain- and source-balanced sampling (69.3 for the OCR
+start, 69.5 for the merge). One possible reading is that the merge already sits
+near a compromise between the five teachers, whereas a single specialist sits at
+one corner, with four teachers pulling at once.</p>
+<p>The score before MOPD therefore works as a filter, not a ranking. It separates
+strong starts from Base, which is 12.8 points below the reference, but says
+little about the endpoint among strong starts. What differs is how fast they get
+there.</p>
+<h2 id="a-second-specialist-bank">A second specialist bank</h2>
+<div class="scope"><b>Scope.</b> <p>Four specialists, 16 benchmarks, and an average over four domain means. These
+numbers are not comparable with the 19-benchmark, five-domain average used
+elsewhere on this site.</p></div>
+<p>The OCR and GUI specialists of the main bank are broad and the two strongest
+overall. A second bank removes them: it keeps the STEM, VQA and embodied
+specialists, adds a narrower OCR specialist and drops GUI.</p>
+<figure><div class="figure-scroll"><a class="figure-zoom" href="/Uni-MOPD/assets/figures/second-bank.png" target="_blank" rel="noopener" aria-label="Open the figure at full size"><img src="/Uni-MOPD/assets/figures/second-bank.png" alt="Average score over 16 benchmarks for four starts across 200 MOPD updates: the base model rises from 59.8 to about 65; the STEM specialist starts at 66.0, stays flat, dips to 65.2 at update 150 and reaches 67.9 at 200; both uniform merges start near 65, dip at update 25, peak at 67.6 and 67.7 at update 100, and end at 66.9. A dashed line marks the best-specialist reference at 68.4." loading="lazy"></a></div><figcaption><p><strong>Second specialist bank.</strong> Average over 16 benchmarks of four
+domains, through 200 updates.</p></figcaption></figure>
+<p>The pattern carries over. The merge scores 65.0 without training, the level the
+base model reaches after 200 updates. Both merges peak at update 100 (67.6 and
+67.7), within 0.3 points of the 67.9 that the STEM start reaches only at update
+200. Scores saturate around update 100 here rather than 50, so the budget should
+be read off held-out scores on a new bank.</p>
+<figure class="figure-wide"><div class="figure-scroll"><a class="figure-zoom" href="/Uni-MOPD/assets/figures/bank2-domains.png" target="_blank" rel="noopener" aria-label="Open the figure at full size"><img src="/Uni-MOPD/assets/figures/bank2-domains.png" alt="Four panels, one per domain of the second bank, showing the domain mean over 200 updates for the uniform merge, the merge at scale 1.25, the STEM specialist start and Base. The STEM specialist starts 6 points above the merges in STEM and stays 1 to 3 points above them from update 50 on. In VQA and OCR the merges lead the STEM-specialist start at updates 100 and 150, for example 67.1 against 63.6 in VQA at update 100. In Embodied the merges reach 56.0 and 56.2 at update 100, level with the dashed line at the embodied specialist." loading="lazy"></a></div><figcaption><p><strong>Second bank, by domain.</strong> Each line is a run from that start; the dashed line is the embodied specialist (56.0).</p></figcaption></figure>
+<p>Two details are specific to this bank. The score dips coincide with
+long-response failures, which the merges resolve early: on AI2D their truncation
+rate peaks at 23–24% at update 25 and falls to about 5% by update 50, while the
+STEM start’s rate climbs to 41% and 76% at updates 100 and 150.</p>
+<figure><div class="figure-scroll"><a class="figure-zoom" href="/Uni-MOPD/assets/figures/bank2-truncation.png" target="_blank" rel="noopener" aria-label="Open the figure at full size"><img src="/Uni-MOPD/assets/figures/bank2-truncation.png" alt="Line chart of the share of AI2D answers that reach the generation cap at updates 25 to 200. Both merges peak at 23 percent at update 25 and fall below 5 percent by update 50 and about 1 percent by update 100. The STEM-specialist start rises to 41 percent at update 100 and 76 percent at update 150 before returning to zero; Base rises to 41 to 53 percent from update 100." loading="lazy"></a></div><figcaption><p><strong>Generation cap in the second bank.</strong> Share of AI2D answers that reach the 32,768-token cap at each evaluated checkpoint.</p></figcaption></figure>
+<p>The embodied mean reaches 55.0 after 50 updates and 56.0 at update 100 (56.2 at
+scale 1.25), level with its specialist’s 56.0. In the main bank, where other
+specialists are strong on part of the embodied domain, the unified model passes
+its specialist (57.1).</p>
+<h2 id="in-practice">In practice</h2>
+<ul>
+<li>If your specialists share a base model, merge them with uniform weights before
+distilling; it costs no training.</li>
+<li>Don’t rank candidate starts by their score before distillation.</li>
+<li>Compare starts after a short run at your planned budget, and look beyond the
+average: starts differ benchmark by benchmark.</li>
+</ul>
+<h2 id="related-notes">Related notes</h2>
+<ul>
+<li><a href="/Uni-MOPD/articles/merge-coefficients/">Are merge coefficients worth tuning?</a></li>
+<li><a href="/Uni-MOPD/articles/what-distillation-adds/">What does distillation add to a strong start?</a></li>
+</ul></div><nav class="pager"><a href="/Uni-MOPD/articles/">← All research notes</a><a href="/Uni-MOPD/articles/merge-coefficients/">Merge coefficients →</a></nav></article></main></div><footer class="site-footer"><div class="wrap"><p><a href="/Uni-MOPD/">Uni-MOPD</a></p></div></footer></body></html>

@@ -1,0 +1,237 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><script>
+      // Apply the stored theme before first paint; without one, follow the system.
+      (() => {
+        const stored = localStorage.getItem("theme");
+        const dark = stored
+          ? stored === "dark"
+          : matchMedia("(prefers-color-scheme: dark)").matches;
+        document.documentElement.dataset.theme = dark ? "dark" : "light";
+      })();
+    </script><title>What does the choice of distillation loss change? · Uni-MOPD</title><link rel="icon" type="image/svg+xml" href="/Uni-MOPD/assets/logo/uni-mopd-favicon.svg"><link rel="icon" type="image/png" sizes="32x32" href="/Uni-MOPD/assets/logo/uni-mopd-favicon-32.png"><link rel="apple-touch-icon" href="/Uni-MOPD/assets/logo/apple-touch-icon.png"><meta name="description" content="Reverse KL, forward KL and ToDi end within 0.4 points of each other on the average, but they get there differently: forward KL and ToDi recover General VQA earlier, reverse KL sharpens the student in the embodied and GUI domains, and distilling on the sampled token alone loses a point and a half."><link rel="canonical" href="https://amberheart.github.io/Uni-MOPD/articles/distillation-loss/"><meta property="og:type" content="article"><meta property="og:title" content="What does the choice of distillation loss change?"><meta property="og:description" content="Reverse KL, forward KL and ToDi end within 0.4 points of each other on the average, but they get there differently: forward KL and ToDi recover General VQA earlier, reverse KL sharpens the student in the embodied and GUI domains, and distilling on the sampled token alone loses a point and a half."><meta property="og:url" content="https://amberheart.github.io/Uni-MOPD/articles/distillation-loss/"><meta name="twitter:card" content="summary_large_image"><link rel="stylesheet" href="/Uni-MOPD/_astro/BaseLayout.TS5X_SpH.css"></head><body><nav class="site-nav"><div class="wrap site-nav__inner"><a class="site-nav__brand" href="/Uni-MOPD/"><img class="logo-light" src="/Uni-MOPD/assets/logo/uni-mopd-mark.svg" alt="" width="22" height="22"><img class="logo-dark" src="/Uni-MOPD/assets/logo/uni-mopd-mark-dark.svg" alt="" width="22" height="22">Uni-MOPD</a><div class="site-nav__links"><a href="/Uni-MOPD/#method">Method</a><a href="/Uni-MOPD/#results">Results</a><a href="/Uni-MOPD/articles/">Research notes</a><a href="/Uni-MOPD/#quickstart">Quick start</a></div><button class="theme-toggle" type="button" aria-label="Switch between light and dark mode" title="Light / dark" data-theme-toggle><svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"></path></svg><svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"></path></svg></button></div></nav><script type="module">document.querySelector(`[data-theme-toggle]`)?.addEventListener(`click`,()=>{let e=document.documentElement,t=e.dataset.theme===`dark`?`light`:`dark`;e.dataset.theme=t,localStorage.setItem(`theme`,t)});</script><div class="page-grid page-grid--article"><aside class="toc" aria-label="Contents"><p class="toc__title">Contents</p><ol><li><a href="#three-divergences-same-run" data-toc-link>Three divergences, same run</a></li><li><a href="#forward-kl-and-todi-recover-vqa-earlier" data-toc-link>Forward KL and ToDi recover VQA earlier</a></li><li><a href="#what-the-training-logs-show" data-toc-link>What the training logs show</a></li><li><a href="#the-divergence-matters-more-offline" data-toc-link>The divergence matters more offline</a></li><li><a href="#how-much-of-the-teachers-distribution-do-you-need" data-toc-link>How much of the teacher’s distribution do you need?</a></li><li><a href="#in-practice" data-toc-link>In practice</a></li><li><a href="#related-notes" data-toc-link>Related notes</a></li></ol><a class="toc__back" href="/Uni-MOPD/">↑ Project page</a></aside><script type="module">var e=[...document.querySelectorAll(`[data-toc-link]`)],t=e.map(e=>document.getElementById(decodeURIComponent(e.hash.slice(1)))).filter(e=>e!==null);if(t.length){let n=()=>{let n=t[0];for(let e of t)e.getBoundingClientRect().top-120<=0&&(n=e);for(let t of e)t.classList.toggle(`is-active`,decodeURIComponent(t.hash.slice(1))===n.id)};document.addEventListener(`scroll`,n,{passive:!0}),n()}</script><main class="page-main"><details class="toc-mobile"><summary>Contents</summary><ol><li><a href="#three-divergences-same-run">Three divergences, same run</a></li><li><a href="#forward-kl-and-todi-recover-vqa-earlier">Forward KL and ToDi recover VQA earlier</a></li><li><a href="#what-the-training-logs-show">What the training logs show</a></li><li><a href="#the-divergence-matters-more-offline">The divergence matters more offline</a></li><li><a href="#how-much-of-the-teachers-distribution-do-you-need">How much of the teacher’s distribution do you need?</a></li><li><a href="#in-practice">In practice</a></li><li><a href="#related-notes">Related notes</a></li></ol></details><article><nav class="crumbs" aria-label="Breadcrumb"><a href="/Uni-MOPD/">Uni-MOPD</a> / <a href="/Uni-MOPD/articles/">Research notes</a></nav><header class="article-head"><h1>What does the choice of distillation loss change?</h1><p class="article-dek">Reverse KL, forward KL and ToDi end within 0.4 points of each other on the average, but they get there differently: forward KL and ToDi recover General VQA earlier, reverse KL sharpens the student in the embodied and GUI domains, and distilling on the sampled token alone loses a point and a half.</p></header><div class="prose"><p>From a strong start, the divergence barely changes the final average: reverse KL
+and ToDi, an adaptive mix of forward and reverse KL, both reach 69.8 after 50
+updates, and forward KL reaches 69.4. The benchmark scores and training logs show
+that the three nevertheless behave differently on the way there. What the student
+is supervised with matters more than the divergence: a policy gradient on the
+sampled token gains 0.5 points in 50 updates, while supervising a distribution
+gains 1.7 to 2.0.</p>
+<h2 id="three-divergences-same-run">Three divergences, same run</h2>
+<p>All three start from the uniform merge and share everything except the
+per-token divergence between the student distribution <span class="katex"><span class="katex-html" aria-hidden="true"><span class="katex-base"><span class="katex-strut" style="height:0.625em;vertical-align:-0.1944em"></span><span class="mord mathnormal">p</span></span></span></span> and the teacher
+distribution <span class="katex"><span class="katex-html" aria-hidden="true"><span class="katex-base"><span class="katex-strut" style="height:0.625em;vertical-align:-0.1944em"></span><span class="mord mathnormal" style="margin-right:0.0359em">q</span></span></span></span>:</p>
+<ul>
+<li><strong>Reverse KL (RKL)</strong>, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="katex-base"><span class="katex-strut" style="height:1em;vertical-align:-0.25em"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em">D</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em"><span class="pstrut" style="height:2.7em"></span><span class="katex-sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight"><span class="mord mathrm mtight">KL</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mord">∥</span><span class="mord mathnormal" style="margin-right:0.0359em">q</span><span class="mclose">)</span></span></span></span>, penalizes student mass on
+tokens the teacher considers unlikely.</li>
+<li><strong>Forward KL (FKL)</strong>, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="katex-base"><span class="katex-strut" style="height:1em;vertical-align:-0.25em"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0278em">D</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em"><span class="pstrut" style="height:2.7em"></span><span class="katex-sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight"><span class="mord mathrm mtight">KL</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.0359em">q</span><span class="mord">∥</span><span class="mord mathnormal">p</span><span class="mclose">)</span></span></span></span>, penalizes the student for
+missing tokens the teacher likes.</li>
+<li><strong>ToDi</strong> mixes the two per token, weighted by <span class="katex"><span class="katex-html" aria-hidden="true"><span class="katex-base"><span class="katex-strut" style="height:1em;vertical-align:-0.25em"></span><span class="mord mathnormal" style="margin-right:0.0359em">σ</span><span class="mopen">(</span><span class="mop">lo<span style="margin-right:0.0139em">g</span></span><span class="mspace" style="margin-right:0.1667em"></span><span class="mord mathnormal" style="margin-right:0.0359em">q</span><span class="mspace" style="margin-right:0.2222em"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em"></span></span><span class="katex-base"><span class="katex-strut" style="height:1em;vertical-align:-0.25em"></span><span class="mop">lo<span style="margin-right:0.0139em">g</span></span><span class="mspace" style="margin-right:0.1667em"></span><span class="mord mathnormal">p</span><span class="mclose">)</span></span></span></span>.</li>
+</ul>
+<table>
+<thead>
+<tr>
+<th>Divergence</th>
+<th style="text-align:right">Avg. at 50</th>
+<th style="text-align:right">STEM</th>
+<th style="text-align:right">VQA</th>
+<th style="text-align:right">OCR</th>
+<th style="text-align:right">GUI</th>
+<th style="text-align:right">Embodied</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>RKL</td>
+<td style="text-align:right"><strong>69.8</strong></td>
+<td style="text-align:right"><strong>71.0</strong></td>
+<td style="text-align:right">64.9</td>
+<td style="text-align:right"><strong>77.8</strong></td>
+<td style="text-align:right">78.3</td>
+<td style="text-align:right"><strong>57.1</strong></td>
+</tr>
+<tr>
+<td>ToDi</td>
+<td style="text-align:right"><strong>69.8</strong></td>
+<td style="text-align:right">70.8</td>
+<td style="text-align:right"><strong>65.5</strong></td>
+<td style="text-align:right">77.6</td>
+<td style="text-align:right">78.3</td>
+<td style="text-align:right">56.9</td>
+</tr>
+<tr>
+<td>FKL</td>
+<td style="text-align:right">69.4</td>
+<td style="text-align:right">70.9</td>
+<td style="text-align:right">65.0</td>
+<td style="text-align:right">77.2</td>
+<td style="text-align:right">78.3</td>
+<td style="text-align:right">55.6</td>
+</tr>
+</tbody>
+</table>
+<h2 id="forward-kl-and-todi-recover-vqa-earlier">Forward KL and ToDi recover VQA earlier</h2>
+<figure class="figure-wide"><div class="figure-scroll"><a class="figure-zoom" href="/Uni-MOPD/assets/figures/divergence-domains.png" target="_blank" rel="noopener" aria-label="Open the figure at full size"><img src="/Uni-MOPD/assets/figures/divergence-domains.png" alt="Six panels showing the average and the five domain means over the first 50 updates for reverse KL, forward KL and ToDi. In the VQA panel, forward KL and ToDi reach about 63.8 at update 30 where reverse KL is at 62.3, and reverse KL reaches the same level only at update 50. In the Embodied panel, reverse KL ends at 57.1, ToDi at 56.9 and forward KL at 55.6." loading="lazy"></a></div><figcaption><p><strong>Domain means over the first 50 updates.</strong> The three runs share
+the start at update 0 and were evaluated every 10 updates. Shading around the first series marks the re-evaluation variation (0.7 points per domain, 0.1 for the average).</p></figcaption></figure>
+<p>The averages cross over: at update 30 ToDi (69.3) and FKL (69.0) are ahead of RKL
+(68.7), and by update 50 RKL has caught up with ToDi and passed FKL. The domains
+explain the crossover.</p>
+<ul>
+<li><strong>General VQA.</strong> From update 30, FKL and ToDi are ahead: 63.7 and 63.8 where
+RKL scores 62.3, and at update 40 FKL leads by 1.5. RKL catches up at update 50
+(64.9 against 65.0 for FKL and 65.5 for ToDi). The order is mixed earlier, and
+FKL dips to 61.6 at update 10.</li>
+<li><strong>Embodied.</strong> The order reverses. RKL reaches 57.1 and keeps rising, ToDi
+reaches 56.9, and FKL stays between 55.0 and 55.6 from update 20 on.</li>
+<li><strong>OCR dips under all three.</strong> At update 10 it falls from 77.0 to 75.9 (RKL),
+75.2 (FKL) and 75.3 (ToDi), and recovers to 77.2 to 77.8 by update 50. The dip
+does not depend on the divergence.</li>
+<li><strong>STEM and GUI</strong> end within 0.3 points of one another.</li>
+</ul>
+<figure class="figure-wide"><div class="figure-scroll"><a class="figure-zoom" href="/Uni-MOPD/assets/figures/divergence-benchmarks.png" target="_blank" rel="noopener" aria-label="Open the figure at full size"><img src="/Uni-MOPD/assets/figures/divergence-benchmarks.png" alt="Dot plot of the change from the merge after 50 updates for each of 19 benchmarks, for reverse KL, forward KL and ToDi. The three agree on most benchmarks. Forward KL and ToDi are ahead on MUIRBench and BabyVision, forward KL is far behind on RefSpatial (plus 2.5 against plus 7.9 and plus 9.0), and reverse KL leads on CharXiv." loading="lazy"></a></div><figcaption><strong>Change from the merge after 50 updates, by benchmark.</strong></figcaption></figure>
+<p>On most benchmarks the three divergences agree to within a point or two, and the
+differences concentrate on a few. MUIRBench gains 5.8 under RKL, 6.7 under FKL
+and 7.5 under ToDi; BabyVision gains 2.1, 2.8 and 4.4. On the embodied side,
+RefSpatial is where forward KL falls behind: it gains 2.5, against 7.9 for RKL
+and 9.0 for ToDi. RKL also gains more on CharXiv (7.0 against 4.5 for FKL and
+5.9 for ToDi).</p>
+<div class="scope"><b>Scope.</b> <p>One seed per divergence, one start, 50 updates; a domain mean varies by up to
+0.7 between evaluations of the same checkpoint. The VQA gap at update 30 (1.4)
+and the embodied gap at update 50 (1.5) exceed that.</p></div>
+<h2 id="what-the-training-logs-show">What the training logs show</h2>
+<p>Losses cannot be compared across divergences, since each run’s loss is its own
+divergence on its own scale. Two diagnostics are measured the same way in all
+three runs, on the student’s own responses: how often the student’s 16 most likely
+tokens are also among the teacher’s 16, and the entropy of the student’s
+distribution.</p>
+<figure class="figure-wide"><div class="figure-scroll"><a class="figure-zoom" href="/Uni-MOPD/assets/figures/divergence-dynamics.png" target="_blank" rel="noopener" aria-label="Open the figure at full size"><img src="/Uni-MOPD/assets/figures/divergence-dynamics.png" alt="Two rows of five panels, one per domain, over the first 50 updates. Top row: overlap of the student's top-16 tokens with the teacher's. In the Embodied panel, reverse KL rises from 0.58 to 0.79 and ToDi to 0.75, while forward KL falls from 0.60 to 0.54. Bottom row: student entropy. Forward KL stays above reverse KL in every domain; in Embodied, 0.35 against 0.12 at update 50." loading="lazy"></a></div><figcaption><p><strong>Agreement with the teacher and student entropy.</strong> Ten-update
+means over the student’s own responses.</p></figcaption></figure>
+<p>Forward KL keeps the student’s distribution broad: its entropy stays above RKL’s
+in every domain, most clearly in embodied (0.35 against 0.12 at update 50) and
+GUI (0.19 against 0.09). In these two domains it also does not raise agreement
+with the teacher. In embodied the overlap falls from 0.60 to 0.54 under FKL while
+it rises from 0.58 to 0.79 under RKL and to 0.75 under ToDi; GUI follows the same
+order (0.73 to 0.70 under FKL, 0.75 to 0.78 under RKL). ToDi sits between the two
+on both diagnostics.</p>
+<p>Our reading is that a mass-covering loss spends part of its signal keeping every
+token the teacher likes alive. That suits benchmarks that draw on broad
+knowledge, where the student has to bring back more of what it knew, and costs
+the benchmarks where the right answer is one precise output, such as the
+referring tasks of RefSpatial; a mode-seeking loss does the opposite. ToDi’s
+per-token weighting interpolates: it recovers VQA about as early as forward KL
+and keeps most of reverse KL’s embodied gain. This interprets one run each.</p>
+<div class="scope"><b>Scope.</b> <p>Window means of the first 50 updates; one seed per divergence. Overlap and
+entropy are measured on the student’s samples, which differ between runs.</p></div>
+<h2 id="the-divergence-matters-more-offline">The divergence matters more offline</h2>
+<p>The same divergences also fit merge coefficients offline
+(<a href="/Uni-MOPD/articles/merge-coefficients/">merge coefficients</a>), where the choice moves the
+score before MOPD by −0.7 to +1.1 points. Online, from a strong start, the three
+end within 0.4 points: when the student generates its own responses and the
+teacher scores them, the divergence has less to decide.</p>
+<figure class="figure-wide"><div class="figure-scroll"><a class="figure-zoom" href="/Uni-MOPD/assets/figures/calibrated-merges.png" target="_blank" rel="noopener" aria-label="Open the figure at full size"><img src="/Uni-MOPD/assets/figures/calibrated-merges.png" alt="Left: slope chart of nine merges before MOPD and after 50 updates, including the four merges fitted with reverse KL (RKL@10), cross-entropy (CE@10), forward KL (FKL@7) and ToDi (ToDi@8). Before MOPD they range from 66.9 to 68.7; after 50 updates they range from 68.9 to 69.7. Right: the average score at each evaluated checkpoint." loading="lazy"></a></div><figcaption><p><strong>The four fitting objectives, offline and online.</strong> RKL@10, CE@10, FKL@7 and ToDi@8 differ by 1.8 points before MOPD and by 0.8 after 50 updates.</p></figcaption></figure>
+<h2 id="how-much-of-the-teachers-distribution-do-you-need">How much of the teacher’s distribution do you need?</h2>
+<p>To vary only the per-token supervision, we reimplemented the method in verl and
+ran four variants from the uniform merge that differ only in the per-token
+objective:</p>
+<ul>
+<li><strong>Sampled token</strong>: a policy gradient on the token the student generated, with
+advantage <span class="katex"><span class="katex-html" aria-hidden="true"><span class="katex-base"><span class="katex-strut" style="height:1em;vertical-align:-0.25em"></span><span class="mop">lo<span style="margin-right:0.0139em">g</span></span><span class="mspace" style="margin-right:0.1667em"></span><span class="mord mathnormal" style="margin-right:0.0359em">q</span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0359em">y</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em"><span class="pstrut" style="height:2.7em"></span><span class="katex-sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em"></span></span><span class="katex-base"><span class="katex-strut" style="height:1em;vertical-align:-0.25em"></span><span class="mop">lo<span style="margin-right:0.0139em">g</span></span><span class="mspace" style="margin-right:0.1667em"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em"><span class="pstrut" style="height:2.7em"></span><span class="katex-sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.0278em">θ</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0359em">y</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em"><span class="pstrut" style="height:2.7em"></span><span class="katex-sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span>.</li>
+<li><strong>Student top-16 / top-128</strong>: the Open-MOPD surrogate over the student’s <span class="katex"><span class="katex-html" aria-hidden="true"><span class="katex-base"><span class="katex-strut" style="height:0.6944em"></span><span class="mord mathnormal" style="margin-right:0.0315em">k</span></span></span></span>
+most likely tokens.</li>
+<li><strong>Full vocabulary</strong>: the full reverse KL of our recipe.</li>
+</ul>
+<figure><div class="figure-scroll"><a class="figure-zoom" href="/Uni-MOPD/assets/figures/supervision-signal.png" target="_blank" rel="noopener" aria-label="Open the figure at full size"><img src="/Uni-MOPD/assets/figures/supervision-signal.png" alt="Left: average score after 50 updates for the four supervision signals, all starting from the uniform merge at 67.6: sampled token 68.1, student top-16 69.6, student top-128 69.6, full vocabulary 69.4, and the same full-vocabulary loss in our framework 69.8. Right: seconds per update, 412, 522, 526, 718, and 266 for our framework." loading="lazy"></a></div><figcaption><p><strong>Per-token supervision signals.</strong> The first four share one
+framework; the last is the same full-vocabulary loss in ours.</p></figcaption></figure>
+<table>
+<thead>
+<tr>
+<th>Objective</th>
+<th style="text-align:right">Avg. @50</th>
+<th style="text-align:right">Gain</th>
+<th style="text-align:right">STEM</th>
+<th style="text-align:right">VQA</th>
+<th style="text-align:right">OCR</th>
+<th style="text-align:right">GUI</th>
+<th style="text-align:right">Emb.</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Sampled token</td>
+<td style="text-align:right">68.1</td>
+<td style="text-align:right">+0.5</td>
+<td style="text-align:right">69.2</td>
+<td style="text-align:right">62.3</td>
+<td style="text-align:right">76.0</td>
+<td style="text-align:right">78.1</td>
+<td style="text-align:right">55.2</td>
+</tr>
+<tr>
+<td>Student top-16</td>
+<td style="text-align:right"><strong>69.6</strong></td>
+<td style="text-align:right">+2.0</td>
+<td style="text-align:right">70.6</td>
+<td style="text-align:right"><strong>64.9</strong></td>
+<td style="text-align:right">77.5</td>
+<td style="text-align:right"><strong>78.6</strong></td>
+<td style="text-align:right"><strong>56.5</strong></td>
+</tr>
+<tr>
+<td>Student top-128</td>
+<td style="text-align:right"><strong>69.6</strong></td>
+<td style="text-align:right">+2.0</td>
+<td style="text-align:right"><strong>71.2</strong></td>
+<td style="text-align:right"><strong>64.9</strong></td>
+<td style="text-align:right">77.2</td>
+<td style="text-align:right">78.4</td>
+<td style="text-align:right">56.4</td>
+</tr>
+<tr>
+<td>Full vocabulary</td>
+<td style="text-align:right">69.4</td>
+<td style="text-align:right">+1.7</td>
+<td style="text-align:right">70.3</td>
+<td style="text-align:right">64.2</td>
+<td style="text-align:right"><strong>77.8</strong></td>
+<td style="text-align:right">78.5</td>
+<td style="text-align:right">56.0</td>
+</tr>
+<tr>
+<td><em>Full vocabulary, our framework</em></td>
+<td style="text-align:right"><em>69.8</em></td>
+<td style="text-align:right"><em>+2.2</em></td>
+<td style="text-align:right"><em>71.0</em></td>
+<td style="text-align:right"><em>64.9</em></td>
+<td style="text-align:right"><em>77.8</em></td>
+<td style="text-align:right"><em>78.3</em></td>
+<td style="text-align:right"><em>57.1</em></td>
+</tr>
+</tbody>
+</table>
+<figure><div class="figure-scroll"><a class="figure-zoom" href="/Uni-MOPD/assets/figures/supervision-domains.png" target="_blank" rel="noopener" aria-label="Open the figure at full size"><img src="/Uni-MOPD/assets/figures/supervision-domains.png" alt="Left: average score at updates 0, 20, 35 and 50 for the four objectives; the sampled-token run is flat until update 35 and ends at 68.1, the other three rise to 69.4 to 69.6. Right: gain after 50 updates by domain. The sampled-token run gains 1.7 on STEM, 0.0 on VQA, minus 1.0 on OCR, 1.1 on GUI and 0.8 on Embodied; the three distribution-level objectives gain 2.8 to 3.7 on STEM, 2.0 to 2.7 on VQA and 1.7 to 2.2 on Embodied." loading="lazy"></a></div><figcaption><strong>Gain after 50 updates by supervision signal and domain.</strong></figcaption></figure>
+<p><strong>The sampled token is the weak signal, and unevenly so.</strong> It still gains 1.7 on
+STEM and 1.1 on GUI, but VQA does not move (0.0) and OCR falls by 1.0, whereas
+the three distribution-level objectives gain 2.0 to 2.7 on VQA and 0.2 to 0.8 on
+OCR. One reading is that a sampled token says which answer the teacher scored,
+while a distribution carries what else the teacher considered at every position,
+and the VQA and OCR domains lean on that more.</p>
+<p><strong>Truncation size barely matters.</strong> Top-16 and top-128 reach the same average
+with eight times the tokens, and the full-vocabulary loss ends close to both, so
+keeping more of the distribution buys no points once you supervise with one. The
+full-vocabulary loss has no truncation size to tune or revisit when the teachers
+or domains change. The usual reason to truncate is cost, and within verl it holds:
+718 seconds per update for the full vocabulary against 522 for top-16. Our
+framework runs the same loss in 266 seconds (<a href="/Uni-MOPD/articles/open-mopd/">framework note</a>).</p>
+<h2 id="in-practice">In practice</h2>
+<ul>
+<li>Supervise with a distribution, not the sampled token.</li>
+<li>Use full-vocabulary reverse KL as the default. If your target is
+knowledge-heavy VQA rather than precise outputs, test forward KL or ToDi; their
+lead showed in the first 30 to 40 updates.</li>
+<li>Don’t spend time tuning <span class="katex"><span class="katex-html" aria-hidden="true"><span class="katex-base"><span class="katex-strut" style="height:0.6944em"></span><span class="mord mathnormal" style="margin-right:0.0315em">k</span></span></span></span>.</li>
+<li>Compare divergences by benchmark scores at a fixed update count, never by loss
+curves.</li>
+</ul>
+<h2 id="related-notes">Related notes</h2>
+<ul>
+<li><a href="/Uni-MOPD/articles/what-distillation-adds/">What does distillation add to a strong start?</a></li>
+<li><a href="/Uni-MOPD/articles/query-allocation/">How should MOPD sample queries across domains?</a></li>
+<li><a href="/Uni-MOPD/articles/open-mopd/">Where does the Open-MOPD recipe lose ground, and what does the framework cost?</a></li>
+</ul></div><nav class="pager"><a href="/Uni-MOPD/articles/what-distillation-adds/">← What distillation adds</a><a href="/Uni-MOPD/articles/query-allocation/">Domain sampling →</a></nav></article></main></div><footer class="site-footer"><div class="wrap"><p><a href="/Uni-MOPD/">Uni-MOPD</a></p></div></footer></body></html>

@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100" role="img" aria-label="Uni-MOPD">
+<title>Uni-MOPD</title>
+<polygon points="50.00,6.00 88.10,28.00 50.00,50.00 11.90,28.00" fill="#f1b1ab"/>
+<polygon points="11.90,28.00 50.00,50.00 50.00,72.00 11.90,50.00" fill="#7dc09b"/>
+<polygon points="11.90,50.00 50.00,72.00 50.00,94.00 11.90,72.00" fill="#7daadd"/>
+<polygon points="50.00,50.00 88.10,28.00 88.10,50.00 50.00,72.00" fill="#a28bca"/>
+<polygon points="50.00,72.00 88.10,50.00 88.10,72.00 50.00,94.00" fill="#d3b070"/>
+<polyline points="11.90,50.00 50.00,72.00 88.10,50.00" fill="none" stroke="#FFFFFF" stroke-width="2.06" stroke-linejoin="round"/>
+<polyline points="11.90,28.00 50.00,50.00 88.10,28.00" fill="none" stroke="#F2F5FA" stroke-width="2.62" stroke-linejoin="round" stroke-linecap="round"/>
+<line x1="50.00" y1="50.00" x2="50.00" y2="94.00" stroke="#F2F5FA" stroke-width="2.62" stroke-linecap="round"/>
+<polygon points="50.00,6.00 88.10,28.00 88.10,72.00 50.00,94.00 11.90,72.00 11.90,28.00" fill="none" stroke="#F2F5FA" stroke-width="3.74" stroke-linejoin="round"/>
+</svg>

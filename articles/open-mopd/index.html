@@ -1,0 +1,164 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><script>
+      // Apply the stored theme before first paint; without one, follow the system.
+      (() => {
+        const stored = localStorage.getItem("theme");
+        const dark = stored
+          ? stored === "dark"
+          : matchMedia("(prefers-color-scheme: dark)").matches;
+        document.documentElement.dataset.theme = dark ? "dark" : "light";
+      })();
+    </script><title>Where does the Open-MOPD recipe lose ground, and what does the framework cost? · Uni-MOPD</title><link rel="icon" type="image/svg+xml" href="/Uni-MOPD/assets/logo/uni-mopd-favicon.svg"><link rel="icon" type="image/png" sizes="32x32" href="/Uni-MOPD/assets/logo/uni-mopd-favicon-32.png"><link rel="apple-touch-icon" href="/Uni-MOPD/assets/logo/apple-touch-icon.png"><meta name="description" content="From the same merge, Uni-MOPD reaches 69.8 after 50 updates and the Open-MOPD recipe 68.5 to 69.0. The difference is concentrated in STEM, which the Open-MOPD runs leave near the merge, and in embodied understanding; they match or lead on GUI and VQA. The framework runs full-vocabulary distillation at 266 seconds per update."><link rel="canonical" href="https://amberheart.github.io/Uni-MOPD/articles/open-mopd/"><meta property="og:type" content="article"><meta property="og:title" content="Where does the Open-MOPD recipe lose ground, and what does the framework cost?"><meta property="og:description" content="From the same merge, Uni-MOPD reaches 69.8 after 50 updates and the Open-MOPD recipe 68.5 to 69.0. The difference is concentrated in STEM, which the Open-MOPD runs leave near the merge, and in embodied understanding; they match or lead on GUI and VQA. The framework runs full-vocabulary distillation at 266 seconds per update."><meta property="og:url" content="https://amberheart.github.io/Uni-MOPD/articles/open-mopd/"><meta name="twitter:card" content="summary_large_image"><link rel="stylesheet" href="/Uni-MOPD/_astro/BaseLayout.TS5X_SpH.css"></head><body><nav class="site-nav"><div class="wrap site-nav__inner"><a class="site-nav__brand" href="/Uni-MOPD/"><img class="logo-light" src="/Uni-MOPD/assets/logo/uni-mopd-mark.svg" alt="" width="22" height="22"><img class="logo-dark" src="/Uni-MOPD/assets/logo/uni-mopd-mark-dark.svg" alt="" width="22" height="22">Uni-MOPD</a><div class="site-nav__links"><a href="/Uni-MOPD/#method">Method</a><a href="/Uni-MOPD/#results">Results</a><a href="/Uni-MOPD/articles/">Research notes</a><a href="/Uni-MOPD/#quickstart">Quick start</a></div><button class="theme-toggle" type="button" aria-label="Switch between light and dark mode" title="Light / dark" data-theme-toggle><svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"></path></svg><svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"></path></svg></button></div></nav><script type="module">document.querySelector(`[data-theme-toggle]`)?.addEventListener(`click`,()=>{let e=document.documentElement,t=e.dataset.theme===`dark`?`light`:`dark`;e.dataset.theme=t,localStorage.setItem(`theme`,t)});</script><div class="page-grid page-grid--article"><aside class="toc" aria-label="Contents"><p class="toc__title">Contents</p><ol><li><a href="#the-gap-is-stem-and-embodied-understanding" data-toc-link>The gap is STEM and embodied understanding</a></li><li><a href="#benchmark-by-benchmark" data-toc-link>Benchmark by benchmark</a></li><li><a href="#a-reading-equal-token-shares-down-weight-stem" data-toc-link>A reading: equal token shares down-weight STEM</a></li><li><a href="#more-updates-do-not-close-the-gap" data-toc-link>More updates do not close the gap</a></li><li><a href="#the-framework" data-toc-link>The framework</a></li><li><a href="#release" data-toc-link>Release</a></li><li><a href="#in-practice" data-toc-link>In practice</a></li><li><a href="#related-notes" data-toc-link>Related notes</a></li></ol><a class="toc__back" href="/Uni-MOPD/">↑ Project page</a></aside><script type="module">var e=[...document.querySelectorAll(`[data-toc-link]`)],t=e.map(e=>document.getElementById(decodeURIComponent(e.hash.slice(1)))).filter(e=>e!==null);if(t.length){let n=()=>{let n=t[0];for(let e of t)e.getBoundingClientRect().top-120<=0&&(n=e);for(let t of e)t.classList.toggle(`is-active`,decodeURIComponent(t.hash.slice(1))===n.id)};document.addEventListener(`scroll`,n,{passive:!0}),n()}</script><main class="page-main"><details class="toc-mobile"><summary>Contents</summary><ol><li><a href="#the-gap-is-stem-and-embodied-understanding">The gap is STEM and embodied understanding</a></li><li><a href="#benchmark-by-benchmark">Benchmark by benchmark</a></li><li><a href="#a-reading-equal-token-shares-down-weight-stem">A reading: equal token shares down-weight STEM</a></li><li><a href="#more-updates-do-not-close-the-gap">More updates do not close the gap</a></li><li><a href="#the-framework">The framework</a></li><li><a href="#release">Release</a></li><li><a href="#in-practice">In practice</a></li><li><a href="#related-notes">Related notes</a></li></ol></details><article><nav class="crumbs" aria-label="Breadcrumb"><a href="/Uni-MOPD/">Uni-MOPD</a> / <a href="/Uni-MOPD/articles/">Research notes</a></nav><header class="article-head"><h1>Where does the Open-MOPD recipe lose ground, and what does the framework cost?</h1><p class="article-dek">From the same merge, Uni-MOPD reaches 69.8 after 50 updates and the Open-MOPD recipe 68.5 to 69.0. The difference is concentrated in STEM, which the Open-MOPD runs leave near the merge, and in embodied understanding; they match or lead on GUI and VQA. The framework runs full-vocabulary distillation at 266 seconds per update.</p></header><div class="prose"><p>Open-MOPD is the existing recipe for multi-teacher on-policy distillation. It
+supervises the student’s top 16 tokens with a clipped policy-gradient loss and
+adds three mechanisms that balance the training budget across domains:
+token-share balancing, gap weighting and reward refresh. We ran an adapted FSDP2
+build of its released code from the same uniform merge, and reimplemented the
+recipe in our verl port with rollout routing replay, with and without the three
+mechanisms. All runs make 50 updates on the same queries in the same order.
+Uni-MOPD reaches 69.8; the FSDP2 build and the Megatron port with routing replay
+both reach 68.5, and the port without the mechanisms 69.0.</p>
+<h2 id="the-gap-is-stem-and-embodied-understanding">The gap is STEM and embodied understanding</h2>
+<figure class="figure-wide"><div class="figure-scroll"><a class="figure-zoom" href="/Uni-MOPD/assets/figures/openmopd-domains.png" target="_blank" rel="noopener" aria-label="Open the figure at full size"><img src="/Uni-MOPD/assets/figures/openmopd-domains.png" alt="Six panels showing the average and the five domain means over the first 50 updates for Uni-MOPD and three Open-MOPD runs. In the STEM panel, Uni-MOPD rises from 67.5 to 71.0 while the FSDP2 and Megatron Open-MOPD runs stay between 66.6 and 67.8; the run without the mechanisms reaches 69.3. In the GUI and VQA panels the Open-MOPD runs are level with or ahead of Uni-MOPD. In the Embodied panel the Megatron run stays at 54.2." loading="lazy"></a></div><figcaption><p><strong>Domain means over the first 50 updates.</strong> Same start, same
+queries. The Open-MOPD runs were evaluated at updates 20, 40 and 50. Shading around the first series marks the re-evaluation variation (0.7 points per domain, 0.1 for the average).</p></figcaption></figure>
+<table>
+<thead>
+<tr>
+<th>Domain mean at 50 updates</th>
+<th style="text-align:right">Uni-MOPD</th>
+<th style="text-align:right">Open-MOPD, FSDP2</th>
+<th style="text-align:right">Open-MOPD, Megatron + R3</th>
+<th style="text-align:right">w/o mechanisms</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>STEM</td>
+<td style="text-align:right"><strong>71.0</strong></td>
+<td style="text-align:right">67.4</td>
+<td style="text-align:right">67.8</td>
+<td style="text-align:right">69.3</td>
+</tr>
+<tr>
+<td>VQA</td>
+<td style="text-align:right">64.9</td>
+<td style="text-align:right">64.8</td>
+<td style="text-align:right"><strong>65.4</strong></td>
+<td style="text-align:right">64.9</td>
+</tr>
+<tr>
+<td>OCR</td>
+<td style="text-align:right"><strong>77.8</strong></td>
+<td style="text-align:right">76.2</td>
+<td style="text-align:right">76.2</td>
+<td style="text-align:right">76.9</td>
+</tr>
+<tr>
+<td>GUI</td>
+<td style="text-align:right">78.3</td>
+<td style="text-align:right"><strong>78.9</strong></td>
+<td style="text-align:right"><strong>78.9</strong></td>
+<td style="text-align:right"><strong>78.9</strong></td>
+</tr>
+<tr>
+<td>Embodied</td>
+<td style="text-align:right"><strong>57.1</strong></td>
+<td style="text-align:right">55.3</td>
+<td style="text-align:right">54.2</td>
+<td style="text-align:right">55.0</td>
+</tr>
+</tbody>
+</table>
+<ul>
+<li><strong>STEM stays at the merge’s level.</strong> The merge scores 67.5. The two Open-MOPD
+runs with the mechanisms score 67.0 and 66.6 at update 20, 67.5 and 67.6 at
+update 40, and 67.4 and 67.8 at update 50, against 69.8, 70.5 and 71.0 for
+Uni-MOPD.</li>
+<li><strong>Embodied understanding barely moves in the Megatron port</strong> (54.3 to 54.2) and
+gains 1.0 in the FSDP2 build, against 2.8 for Uni-MOPD.</li>
+<li><strong>GUI and VQA are not where the gap is.</strong> All three Open-MOPD runs end 0.6
+points above Uni-MOPD on GUI, and the Megatron port with routing replay ends
+0.5 above on VQA.</li>
+</ul>
+<h2 id="benchmark-by-benchmark">Benchmark by benchmark</h2>
+<figure class="figure-wide"><div class="figure-scroll"><a class="figure-zoom" href="/Uni-MOPD/assets/figures/openmopd-benchmarks.png" target="_blank" rel="noopener" aria-label="Open the figure at full size"><img src="/Uni-MOPD/assets/figures/openmopd-benchmarks.png" alt="Dot plot of the change from the merge after 50 updates for each of 19 benchmarks, for Uni-MOPD and the three Open-MOPD runs. MathVision falls by 4.3 and 2.3 in the two Open-MOPD runs with the mechanisms while Uni-MOPD gains 3.0. We-Math and RefSpatial gain less in all Open-MOPD runs. Open-MOPD gains more on BabyVision, OSWorld-G and ScreenSpot-Pro. OCRBench v2 falls by about 4.8 in the two Open-MOPD runs with the mechanisms and by 3.8 in Uni-MOPD." loading="lazy"></a></div><figcaption><strong>Change from the merge after 50 updates, by benchmark.</strong></figcaption></figure>
+<p>The STEM gap sits on the benchmarks where the STEM teacher leads. MathVision
+falls below the merge under the FSDP2 build (−4.3) and the Megatron port (−2.3)
+while Uni-MOPD gains 3.0, and We-Math gains 3.0 and 2.1 in those runs against 7.6.
+On the embodied side, RefSpatial gains 4.3 and 2.9 against 7.9, and MMSI-Bench
+falls by 1.7 and 2.6 where Uni-MOPD gains 0.7. In the other direction, the
+Open-MOPD runs gain more on BabyVision (4.1 and 5.2 against 2.1), OSWorld-G (4.4
+and 4.1 against 3.5) and ScreenSpot-Pro (1.1 and 1.5 against 0.2). OCRBench v2
+falls in every run, by 4.8 and 4.9 in the two with the mechanisms and 3.8 in
+Uni-MOPD.</p>
+<p>Removing the three mechanisms moves the profile toward Uni-MOPD’s: MathVision turns
+from −2.3 to +1.4, We-Math from +2.1 to +5.3, and the STEM mean rises from 67.8
+to 69.3. RefSpatial does not follow (+1.4).</p>
+<h2 id="a-reading-equal-token-shares-down-weight-stem">A reading: equal token shares down-weight STEM</h2>
+<p>Token-share balancing reweights each domain’s loss so that every domain
+contributes an equal share of the batch’s response tokens. Under uniform
+sampling, STEM answers grow to about twenty times the length of GUI answers, and
+we observed STEM carry about 60% of the response tokens in our main run (see
+<a href="/Uni-MOPD/articles/query-allocation/">domain sampling</a>). Holding every domain to a fifth
+of the tokens would cut STEM’s share to a third of that, so the domain whose long
+responses carry most of the learning signal is the one the recipe down-weights
+most, and the one that stays at the merge’s level. The run without the
+mechanisms recovers part of the STEM gain, consistent with this reading but not
+isolating token-share balancing from gap weighting and reward refresh.</p>
+<div class="scope"><b>Scope.</b> <p>Single seed per run, evaluated at updates 20, 40 and 50. The STEM and embodied
+differences between the FSDP2 build and Uni-MOPD (3.6 and 1.8 points) exceed
+the 0.7-point variation between evaluations of the same checkpoint.</p></div>
+<h2 id="more-updates-do-not-close-the-gap">More updates do not close the gap</h2>
+<figure><div class="figure-scroll"><a class="figure-zoom" href="/Uni-MOPD/assets/figures/openmopd-long.png" target="_blank" rel="noopener" aria-label="Open the figure at full size"><img src="/Uni-MOPD/assets/figures/openmopd-long.png" alt="Three panels over 200 optimizer updates: the average, the STEM mean and the Embodied mean for Uni-MOPD and for Open-MOPD runs that make four updates or one update per rollout batch. Uni-MOPD is at 69.8 at update 50 and 69.4 at update 200. The four-update Open-MOPD run is at 68.7 at update 50 and 68.9 at update 200, and the one-update run is at 68.6 at update 50; the STEM mean of the four-update run is 67.4 at update 50 and 68.2 at update 200, against 71.0 and 70.3 for Uni-MOPD." loading="lazy"></a></div><figcaption><p><strong>Continuing the Open-MOPD recipe to 200 updates.</strong> The Open-MOPD
+runs reuse each rollout batch for four updates or make one update per batch,
+and have no routing replay.</p></figcaption></figure>
+<p>An earlier Open-MOPD run from the same merge reaches 68.7 at update 50 and 68.9 at
+update 200. Its STEM mean is 67.4 and then 68.2, and its embodied mean 55.0 and
+then 55.8, against 70.3 and 56.3 for Uni-MOPD at update 200. A run that makes one
+update per batch is level with it at update 50 (68.6). Four times the updates
+close part of the STEM gap and little of the rest.</p>
+<h2 id="the-framework">The framework</h2>
+<p>Full-vocabulary distillation sounds expensive: five teachers, a
+mixture-of-experts student, and a full next-token distribution at every response
+position. In our framework one update takes 266 seconds on 24 H200 GPUs, 3.3×
+faster than the adapted FSDP2 build of the released Open-MOPD code on the same
+hardware and 2.3× faster than a verl implementation of the same loss.</p>
+<figure><div class="figure-scroll"><a class="figure-zoom" href="/Uni-MOPD/assets/figures/training-architecture.png" target="_blank" rel="noopener" aria-label="Open the figure at full size"><img src="/Uni-MOPD/assets/figures/training-architecture.png" alt="Three stages: student rollout generating responses in chunks; domain teacher scoring with frozen teachers cached in CPU memory and one active teacher on GPU; student update with full-vocabulary reverse KL on response positions and replay of the rollout's expert routing. Updated weights sync back to the rollout engine." loading="lazy"></a></div><figcaption><p><strong>Training framework.</strong> Rollout, teacher scoring and the student
+update run as separate components.</p></figcaption></figure>
+<p>The student writes responses, the frozen teacher of each query’s domain scores
+the same prefixes with its full next-token distribution, and the student
+minimizes reverse KL to it. Three ideas keep this affordable:</p>
+<ul>
+<li><strong>Compute only what the loss uses.</strong> Logits exist only at response positions,
+and the loss is sharded and chunked over the vocabulary, so the full
+distribution is compared without ever materializing it at once.</li>
+<li><strong>One teacher at a time.</strong> Teachers wait in CPU memory and are swapped onto
+the GPUs when their domain comes up, so five 30B-parameter teachers never
+have to be resident together.</li>
+<li><strong>Overlap generation and scoring.</strong> Finished responses stream into teacher
+scoring while long ones are still being generated, and the update waits for
+the whole batch, so every response in it comes from the same policy.</li>
+</ul>
+<p>For the mixture-of-experts student, rollout routing replay makes training use the
+same experts that generation chose for each token. In a typical update,
+generation takes about 60% of the wall-clock time and teacher scoring a little
+over a third, with the phases overlapping. The rollouts, not the full
+distribution, set the pace, so truncating the supervision saves little time.</p>
+<figure><div class="figure-scroll"><a class="figure-zoom" href="/Uni-MOPD/assets/figures/framework-time.png" target="_blank" rel="noopener" aria-label="Open the figure at full size"><img src="/Uni-MOPD/assets/figures/framework-time.png" alt="Left: seconds per update on 24 H200 GPUs for 50 updates: 888 for the adapted released Open-MOPD code, 348 for the Open-MOPD recipe in our verl port and 266 for Uni-MOPD. Right: within one Uni-MOPD update, student generation takes 159 seconds, 60 percent, and teacher scoring 98 seconds, 37 percent." loading="lazy"></a></div><figcaption><p><strong>Seconds per update.</strong> (a) Uni-MOPD against the Open-MOPD implementations: 89, 116 and 296 H200 GPU-hours for 50 updates. (b) The two phases overlap within one update.</p></figcaption></figure>
+<p>The speedup covers the complete training implementations, including their
+execution backends. Fifty updates, the budget behind the main results, take under
+four hours.</p>
+<h2 id="release">Release</h2>
+<p>The training framework, the five specialists and the unified student are
+released with the paper; the links are on <a href="/Uni-MOPD/">the project page</a>.</p>
+<h2 id="in-practice">In practice</h2>
+<ul>
+<li>Check per-domain curves, not only the average: a recipe that matches on GUI and
+VQA can leave STEM untouched.</li>
+<li>Be careful with a loss reweighting that equalizes tokens across domains when
+answer lengths differ by an order of magnitude.</li>
+<li>Compare recipes at a matched update count and report what each update costs.</li>
+</ul>
+<h2 id="related-notes">Related notes</h2>
+<ul>
+<li><a href="/Uni-MOPD/articles/distillation-loss/">What does the choice of distillation loss change?</a></li>
+<li><a href="/Uni-MOPD/articles/query-allocation/">How should MOPD sample queries across domains?</a></li>
+</ul></div><nav class="pager"><a href="/Uni-MOPD/articles/query-allocation/">← Domain sampling</a></nav></article></main></div><footer class="site-footer"><div class="wrap"><p><a href="/Uni-MOPD/">Uni-MOPD</a></p></div></footer></body></html>

@@ -1,0 +1,105 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><script>
+      // Apply the stored theme before first paint; without one, follow the system.
+      (() => {
+        const stored = localStorage.getItem("theme");
+        const dark = stored
+          ? stored === "dark"
+          : matchMedia("(prefers-color-scheme: dark)").matches;
+        document.documentElement.dataset.theme = dark ? "dark" : "light";
+      })();
+    </script><title>What does distillation add to a strong start? · Uni-MOPD</title><link rel="icon" type="image/svg+xml" href="/Uni-MOPD/assets/logo/uni-mopd-favicon.svg"><link rel="icon" type="image/png" sizes="32x32" href="/Uni-MOPD/assets/logo/uni-mopd-favicon-32.png"><link rel="apple-touch-icon" href="/Uni-MOPD/assets/logo/apple-touch-icon.png"><meta name="description" content="Fifty MOPD updates recover 67% of the gap the merge leaves. The gains go where the domain teacher still leads, arrive on different benchmarks at different times, and embodied understanding ends above its own specialist. The loss keeps falling long after the scores stop."><link rel="canonical" href="https://amberheart.github.io/Uni-MOPD/articles/what-distillation-adds/"><meta property="og:type" content="article"><meta property="og:title" content="What does distillation add to a strong start?"><meta property="og:description" content="Fifty MOPD updates recover 67% of the gap the merge leaves. The gains go where the domain teacher still leads, arrive on different benchmarks at different times, and embodied understanding ends above its own specialist. The loss keeps falling long after the scores stop."><meta property="og:url" content="https://amberheart.github.io/Uni-MOPD/articles/what-distillation-adds/"><meta name="twitter:card" content="summary_large_image"><link rel="stylesheet" href="/Uni-MOPD/_astro/BaseLayout.TS5X_SpH.css"></head><body><nav class="site-nav"><div class="wrap site-nav__inner"><a class="site-nav__brand" href="/Uni-MOPD/"><img class="logo-light" src="/Uni-MOPD/assets/logo/uni-mopd-mark.svg" alt="" width="22" height="22"><img class="logo-dark" src="/Uni-MOPD/assets/logo/uni-mopd-mark-dark.svg" alt="" width="22" height="22">Uni-MOPD</a><div class="site-nav__links"><a href="/Uni-MOPD/#method">Method</a><a href="/Uni-MOPD/#results">Results</a><a href="/Uni-MOPD/articles/">Research notes</a><a href="/Uni-MOPD/#quickstart">Quick start</a></div><button class="theme-toggle" type="button" aria-label="Switch between light and dark mode" title="Light / dark" data-theme-toggle><svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"></path></svg><svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"></path></svg></button></div></nav><script type="module">document.querySelector(`[data-theme-toggle]`)?.addEventListener(`click`,()=>{let e=document.documentElement,t=e.dataset.theme===`dark`?`light`:`dark`;e.dataset.theme=t,localStorage.setItem(`theme`,t)});</script><div class="page-grid page-grid--article"><aside class="toc" aria-label="Contents"><p class="toc__title">Contents</p><ol><li><a href="#gains-go-where-the-teacher-still-leads" data-toc-link>Gains go where the teacher still leads</a></li><li><a href="#when-each-benchmark-moves" data-toc-link>When each benchmark moves</a></li><li><a href="#one-domain-passes-its-own-specialist" data-toc-link>One domain passes its own specialist</a></li><li><a href="#the-loss-keeps-falling-after-the-score-stops" data-toc-link>The loss keeps falling after the score stops</a></li><li><a href="#the-student-has-to-generate" data-toc-link>The student has to generate</a></li><li><a href="#in-practice" data-toc-link>In practice</a></li><li><a href="#related-notes" data-toc-link>Related notes</a></li></ol><a class="toc__back" href="/Uni-MOPD/">↑ Project page</a></aside><script type="module">var e=[...document.querySelectorAll(`[data-toc-link]`)],t=e.map(e=>document.getElementById(decodeURIComponent(e.hash.slice(1)))).filter(e=>e!==null);if(t.length){let n=()=>{let n=t[0];for(let e of t)e.getBoundingClientRect().top-120<=0&&(n=e);for(let t of e)t.classList.toggle(`is-active`,decodeURIComponent(t.hash.slice(1))===n.id)};document.addEventListener(`scroll`,n,{passive:!0}),n()}</script><main class="page-main"><details class="toc-mobile"><summary>Contents</summary><ol><li><a href="#gains-go-where-the-teacher-still-leads">Gains go where the teacher still leads</a></li><li><a href="#when-each-benchmark-moves">When each benchmark moves</a></li><li><a href="#one-domain-passes-its-own-specialist">One domain passes its own specialist</a></li><li><a href="#the-loss-keeps-falling-after-the-score-stops">The loss keeps falling after the score stops</a></li><li><a href="#the-student-has-to-generate">The student has to generate</a></li><li><a href="#in-practice">In practice</a></li><li><a href="#related-notes">Related notes</a></li></ol></details><article><nav class="crumbs" aria-label="Breadcrumb"><a href="/Uni-MOPD/">Uni-MOPD</a> / <a href="/Uni-MOPD/articles/">Research notes</a></nav><header class="article-head"><h1>What does distillation add to a strong start?</h1><p class="article-dek">Fifty MOPD updates recover 67% of the gap the merge leaves. The gains go where the domain teacher still leads, arrive on different benchmarks at different times, and embodied understanding ends above its own specialist. The loss keeps falling long after the scores stop.</p></header><div class="prose"><p>The merge already integrates most of what the specialists know and leaves a set
+of specific gaps. Fifty MOPD updates take the uniform merge from 67.6 to 69.8,
+raise every domain, and close 67% of what the merge left. This note looks at
+where the gains land, when they arrive, and why the loss is a poor guide to them.</p>
+<h2 id="gains-go-where-the-teacher-still-leads">Gains go where the teacher still leads</h2>
+<p>Across the 19 benchmarks, the gain after 50 updates tracks how far the domain
+teacher still leads the merge (Spearman ρ = 0.77).</p>
+<figure><div class="figure-scroll"><a class="figure-zoom" href="/Uni-MOPD/assets/figures/benchmark-gains.png" target="_blank" rel="noopener" aria-label="Open the figure at full size"><img src="/Uni-MOPD/assets/figures/benchmark-gains.png" alt="Bars show the change of each of 19 benchmarks after 50 MOPD updates from the uniform merge; markers show how far the domain teacher leads the merge on the same benchmark. Large gains on We-Math, CharXiv and RefSpatial coincide with large teacher leads; DocVQA and OCRBench v2 lie at the low end where the teacher barely leads or trails." loading="lazy"></a></div><figcaption><p><strong>Per-benchmark gains.</strong> Bars: change after 50 updates from the
+uniform merge. Markers: the domain teacher’s lead over the merge.</p></figcaption></figure>
+<p>The largest gains are where the teacher led most: We-Math gains 7.6 against a
+12.6-point gap, RefSpatial 7.9 against 10.1, CharXiv 7.0 against 8.6. On DocVQA
+and OCRBench v2 the teacher leads the merge by less than a point or trails it,
+and little remains to transfer. Routing is the likely reason: each query
+goes to its domain’s teacher, so supervision is strongest where that teacher
+still knows more than the student. It also explains why more elaborate sampling has
+little left to add (see <a href="/Uni-MOPD/articles/query-allocation/">domain sampling</a>).</p>
+<h2 id="when-each-benchmark-moves">When each benchmark moves</h2>
+<figure class="figure-wide"><div class="figure-scroll"><a class="figure-zoom" href="/Uni-MOPD/assets/figures/gain-timing-heatmap.png" target="_blank" rel="noopener" aria-label="Open the figure at full size"><img src="/Uni-MOPD/assets/figures/gain-timing-heatmap.png" alt="Heatmap of the change from the uniform merge for each of 19 benchmarks at 11 checkpoints from update 10 to update 200. We-Math, CharXiv, RefSpatial and MUIRBench show the largest positive cells, OCRBench v2 and DocVQA stay negative, and ScreenSpot-v2, DynaMath and MMBench stay near zero. A dashed line separates the first 50 updates from later checkpoints." loading="lazy"></a></div><figcaption><p><strong>Change from the uniform merge at every evaluated checkpoint.</strong>
+Blue: above the merge, vermilion: below. The dashed line marks update 50.
+Differences of a few points on a single benchmark are within re-evaluation variation.</p></figcaption></figure>
+<figure class="figure-wide"><div class="figure-scroll"><a class="figure-zoom" href="/Uni-MOPD/assets/figures/gain-timing-lines.png" target="_blank" rel="noopener" aria-label="Open the figure at full size"><img src="/Uni-MOPD/assets/figures/gain-timing-lines.png" alt="Four panels of line charts, one line per benchmark, showing the change from the uniform merge at each checkpoint from update 10 to 200, grouped by pattern. Rise and hold: MUIRBench, TreeBench and MathVision stay above the merge. Peak, then settle: RefSpatial peaks at plus 10.1 at update 75, CharXiv at plus 8.0, and We-Math drops from plus 7.6 at update 50 to plus 2.6 at update 75 before climbing again. Dip below the merge: OCRBench v2, DocVQA and EmbSpatial. Barely move: ScreenSpot-v2, ScreenSpot-Pro, DynaMath and MMBench." loading="lazy"></a></div><figcaption><p><strong>Benchmark by benchmark.</strong> Change from the uniform merge at every evaluated checkpoint, grouped by pattern; the dashed line marks update 50.</p></figcaption></figure>
+<ul>
+<li><strong>Gains do not arrive together.</strong> We-Math rises by 4.2 in the first 20 updates
+and reaches +7.6 at update 50. MUIRBench stays within about one point of the
+merge until update 40, then jumps to +5.8 at update 50 and holds between +5.5
+and +6.6 through update 200.</li>
+<li><strong>Some gains are partly given back.</strong> We-Math falls to +2.6 at update 75 and
+climbs to +5.5 by update 200. RefSpatial peaks at +10.1 at update 75 and ends at
++6.1, CharXiv peaks at +8.0 and ends at +5.0. TreeBench keeps rising, from
++2.2 at update 50 to +4.2 at update 175.</li>
+<li><strong>Some benchmarks decline.</strong> OCRBench v2 and DocVQA fall below the merge in the
+first updates and recover only partly (−3.8 and −1.4 at update 50, −1.7 and
+−0.4 at update 200). EmbSpatial-Bench slips by 1.7 by update 200.</li>
+<li><strong>Several benchmarks barely move.</strong> ScreenSpot-v2, ScreenSpot-Pro, DynaMath and
+MMBench stay within about 1.5 points of the merge at every checkpoint, so the
+average gain comes from the other fifteen.</li>
+</ul>
+<p>The average is flat from update 75 to 200 (69.4 to 69.7, against 69.8 at update
+50) while individual benchmarks still move by several points, so the pattern
+across benchmarks is more stable than any single checkpoint.</p>
+<div class="scope"><b>Scope.</b> <p>Main run, one seed; a domain mean varies by up to 0.7 between evaluations of
+the same checkpoint.</p></div>
+<h2 id="one-domain-passes-its-own-specialist">One domain passes its own specialist</h2>
+<p>The embodied specialist scores 56.0 on its domain. The unified model reaches 57.1
+and stays at or above 56.0 from update 30 on. The two stages supply different
+halves: the embodied specialist leads only on referring and multi-image spatial
+reasoning, while on TreeBench and EmbSpatial-Bench the VQA and OCR specialists
+are stronger and the merge keeps their strengths. MOPD then recovers most of the
+RefSpatial gap, from 60.3 to 68.2, the largest one left in the domain.</p>
+<figure class="figure-wide"><div class="figure-scroll"><a class="figure-zoom" href="/Uni-MOPD/assets/figures/embodied-lines.png" target="_blank" rel="noopener" aria-label="Open the figure at full size"><img src="/Uni-MOPD/assets/figures/embodied-lines.png" alt="Five panels over 200 updates for the embodied domain mean and its four benchmarks, with the embodied specialist as a dashed line. The embodied mean rises from 54.3 to 57.1 and stays at or above the specialist from update 30. RefSpatial rises from 60.3 to 70.4 at update 75 against the specialist at 70.4. TreeBench and EmbSpatial lie above the embodied specialist throughout; TreeBench passes the VQA specialist (48.6) from update 100, and EmbSpatial stays 0.2 to 2.1 below the OCR specialist (80.6)." loading="lazy"></a></div><figcaption><p><strong>The embodied domain.</strong> Uni-MOPD against the embodied specialist (dashed), and against the strongest other specialist on TreeBench and EmbSpatial-Bench (dotted).</p></figcaption></figure>
+<figure><div class="figure-scroll"><a class="figure-zoom" href="/Uni-MOPD/assets/figures/teacher-agreement.png" target="_blank" rel="noopener" aria-label="Open the figure at full size"><img src="/Uni-MOPD/assets/figures/teacher-agreement.png" alt="Top-16 overlap between student and teacher distributions per domain over the first 50 MOPD updates. Embodied rises from 0.58 to 0.79; the other domains start between 0.75 and 0.83 and change less." loading="lazy"></a></div><figcaption><p><strong>Student–teacher agreement by domain:</strong> the share of the
+student’s 16 most likely tokens that also appear among the teacher’s 16, on
+the student’s own responses.</p></figcaption></figure>
+<div class="scope"><b>Scope.</b> <p>Main run, one seed, first 50 updates, measured during training.</p></div>
+<p>The training logs agree. Embodied is where the merged student starts furthest
+from its teacher in distribution, and its agreement rises most, until it is
+level with the GUI and VQA domains.</p>
+<h2 id="the-loss-keeps-falling-after-the-score-stops">The loss keeps falling after the score stops</h2>
+<p>The training loss measures agreement with the teacher on the student’s own
+outputs. Averaged over all domains, it falls from 0.32 in the first 10 updates to
+0.11 in updates 41 to 50 and 0.05 in updates 191 to 200, while the average score
+levels at update 50.</p>
+<figure class="figure-wide"><div class="figure-scroll"><a class="figure-zoom" href="/Uni-MOPD/assets/figures/loss-vs-score.png" target="_blank" rel="noopener" aria-label="Open the figure at full size"><img src="/Uni-MOPD/assets/figures/loss-vs-score.png" alt="Top panel: the training loss per update over 200 updates falls from about 0.3 to about 0.05 while the average score rises from 67.6 to 69.8 by update 50 and stays between 69.4 and 69.7. Middle row: for each of the five domains, the 10-update mean loss as a share of the first window, falling in every domain. Bottom row: the domain score change from the merge, rising in every domain; GUI gains most of its improvement in the first window, and VQA gains little until update 40." loading="lazy"></a></div><figcaption><p><strong>Loss against score in the main run.</strong> (a) All domains, 200
+updates. (b) Per domain, first 50 updates; shading marks the 0.7-point
+re-evaluation variation of a domain score.</p></figcaption></figure>
+<p>Loss and score relate differently across domains. In embodied and STEM the loss
+falls (1.07 to 0.27 and 0.11 to 0.05) as the score rises (54.4 to 57.1 and 67.4
+to 71.0). In GUI the loss halves between the first and last window (0.28 to 0.14)
+while the score moves only from 78.0 to 78.3, because most of its gain, from
+77.0, arrives in the first 10 updates. In VQA the loss edges up in the last
+window (0.250 to 0.259) while the score rises by 1.3.</p>
+<p>Neither the loss nor the first few checkpoints is a reliable stopping rule; judge
+a run by a small held-out benchmark panel. Every checkpoint from update 75 to 200
+stays within 0.5 points of update 50, which is why we use 50 updates.</p>
+<h2 id="the-student-has-to-generate">The student has to generate</h2>
+<p>The same recipe trained on fixed prefixes written by the teachers reaches 68.6
+after 50 updates, 1.2 points below the on-policy run (69.8), and trails at every
+checkpoint (67.6, 67.9 and 68.2 at updates 20, 30 and 40, against 68.3, 68.7 and
+69.0). One plausible reason
+is that the student’s mistakes appear in its own responses rather than in the
+teacher’s, so only on-policy data shows the teacher where to correct.</p>
+<figure class="figure-wide"><div class="figure-scroll"><a class="figure-zoom" href="/Uni-MOPD/assets/figures/onpolicy-domains.png" target="_blank" rel="noopener" aria-label="Open the figure at full size"><img src="/Uni-MOPD/assets/figures/onpolicy-domains.png" alt="Six panels with the average and the five domain means over the first 50 updates for student-generated responses and for teacher-generated prefixes. The two runs track each other on VQA and GUI; student-generated responses pull ahead on STEM from update 20, on OCR and on Embodied from update 30, and the average ends at 69.8 against 68.6." loading="lazy"></a></div><figcaption><p><strong>On-policy against teacher-generated prefixes, by domain.</strong> The gap opens in STEM, OCR and embodied understanding.</p></figcaption></figure>
+<h2 id="in-practice">In practice</h2>
+<ul>
+<li>Distill after merging, and budget tens of updates, not hundreds.</li>
+<li>Expect the gains where the domain teacher still leads, and little where it
+does not, including small losses on benchmarks where the teacher is no better
+than the merge.</li>
+<li>Keep the responses on-policy.</li>
+<li>Stop on held-out scores, not on the loss.</li>
+</ul>
+<h2 id="related-notes">Related notes</h2>
+<ul>
+<li><a href="/Uni-MOPD/articles/where-to-start/">Where should a multi-teacher distillation student start?</a></li>
+<li><a href="/Uni-MOPD/articles/distillation-loss/">What does the choice of distillation loss change?</a></li>
+</ul></div><nav class="pager"><a href="/Uni-MOPD/articles/merge-coefficients/">← Merge coefficients</a><a href="/Uni-MOPD/articles/distillation-loss/">Distillation loss →</a></nav></article></main></div><footer class="site-footer"><div class="wrap"><p><a href="/Uni-MOPD/">Uni-MOPD</a></p></div></footer></body></html>
